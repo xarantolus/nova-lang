@@ -27,6 +27,7 @@ pub enum EngineObject<'a> {
     Function {
         // Position of the function in the script, at the opening brace of arguments. We can jump to it to call it.
         position: usize,
+        num_args: usize,
     },
     // A simple integer value.
     Int(i32),
@@ -77,7 +78,9 @@ impl core::fmt::Display for EngineObject<'_> {
                 )
             }
             EngineObject::Module(_) => write!(f, "<module>"),
-            EngineObject::Function { position } => write!(f, "<function@{}>", position),
+            EngineObject::Function { position, num_args } => {
+                write!(f, "<function({})@{}>", num_args, position)
+            }
             EngineObject::Handle { id, .. } => write!(f, "<handle@{}>", id),
             EngineObject::Unit => write!(f, "void"),
             EngineObject::MemberAccess { name } => write!(
@@ -140,6 +143,7 @@ pub enum InterpreterError<'a> {
         found: Token<'a>,
     },
     ExpressionStackExhausted,
+    TooManySteps,
     StackOverflow,
     UnexpectedEoF,
 }
@@ -219,7 +223,29 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
     }
 
     pub fn run(&mut self) -> Result<(), InterpreterError<'a>> {
-        while let Ok(true) = self.step() {}
+        loop {
+            match self.step() {
+                Err(e) => return Err(e),
+                Ok(false) => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn run_bounded(&mut self, max_steps: usize) -> Result<(), InterpreterError<'a>> {
+        let mut i = 0;
+        loop {
+            if i > max_steps {
+                return Err(InterpreterError::TooManySteps);
+            }
+            match self.step() {
+                Err(e) => return Err(e),
+                Ok(false) => break,
+                _ => {}
+            }
+            i += 1;
+        }
         Ok(())
     }
 
@@ -239,7 +265,51 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                 self.set_var(var_name, value)?;
             }
             (Token::Fn, Token::Identifier(function_name)) => {
-                unimplemented!("function definitions")
+                self.consume_token(&Token::Fn)?;
+                self.tokenizer.advance();
+                self.consume_token(&Token::LParen)?;
+                let function_pos = self.tokenizer.cursor_pos();
+
+                let mut nargs = 0;
+                // Skip function args - we always expect ident, comma
+                // Future: maybe allow some kind of type annotations?
+                let mut next_ident = true;
+                loop {
+                    match self.tokenizer.advance() {
+                        Token::Identifier(_) if next_ident => {
+                            nargs += 1;
+                            next_ident = false;
+                        }
+                        Token::Comma if !next_ident => {
+                            next_ident = true;
+                        }
+                        Token::RParen if (!next_ident || nargs == 0) => break,
+                        tok => {
+                            return Err(InterpreterError::UnexpectedToken {
+                                expected: if next_ident {
+                                    Token::Identifier(&[])
+                                } else {
+                                    Token::Comma
+                                },
+                                found: tok,
+                            });
+                        }
+                    }
+                }
+
+                self.consume_token(&Token::LBrace)?;
+
+                self.skip_block()?;
+
+                self.consume_separator()?;
+
+                self.set_var(
+                    function_name,
+                    EngineObject::Function {
+                        position: function_pos,
+                        num_args: nargs,
+                    },
+                )?;
             }
             (Token::If, _) => {
                 // After if comes an expression
@@ -265,7 +335,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             // Anything else is just an expression, e.g. a function call
             _ => {
                 // Expression
-                unimplemented!("catch all")
+                unimplemented!("catch all: {:#?}, {:#?}", first_token, second_token)
             }
         }
 
@@ -684,5 +754,50 @@ mod tests {
         let mut vm: VmContext<'_> = VmContext::new(b"a = 5 + 5;");
         assert!(vm.run().is_ok());
         assert_eq!(*vm.get_var(b"a").unwrap(), 10.into());
+    }
+
+    #[test]
+    fn assign_multiple_variables() {
+        let mut vm: VmContext<'_> = VmContext::new(b"a = 5 + 5; b = a + 5;");
+        assert!(vm.run().is_ok());
+        assert_eq!(*vm.get_var(b"a").unwrap(), 10.into());
+        assert_eq!(*vm.get_var(b"b").unwrap(), 15.into());
+    }
+
+    #[test]
+    fn assign_too_many_variables() {
+        // Limit stack to at most 2 variables
+        let mut vm: VmContext<'_, 2, 16, 8, 16> =
+            VmContext::new(b"a = 5 + 5; b = a + 5; c = b + a;");
+        assert!(matches!(vm.run(), Err(InterpreterError::StackOverflow)));
+    }
+
+    #[test]
+    fn declare_function() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br#"fn test(a, b) { return a + b }
+            fn test2() { return 7 }
+        "#,
+        );
+        vm.run().expect("Running VM to declare function");
+        {
+            let test_func = vm.get_var(b"test").expect("function to be variable");
+            assert!(matches!(
+                test_func,
+                EngineObject::Function {
+                    position: 8,
+                    num_args: 2
+                }
+            ));
+        }
+
+        let test_func2 = vm.get_var(b"test2").expect("function to be variable");
+        assert!(matches!(
+            test_func2,
+            EngineObject::Function {
+                position: 52,
+                num_args: 0
+            }
+        ));
     }
 }
