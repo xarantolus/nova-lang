@@ -165,6 +165,7 @@ pub enum InterpreterError<'a> {
 }
 
 #[derive(PartialEq)]
+#[cfg_attr(any(test, debug_assertions), derive(Debug))]
 enum BlockScope {
     Normal,
     While {
@@ -175,6 +176,10 @@ enum BlockScope {
     },
     If,
     Else,
+    Function {
+        // We act as the frame pointer here
+        return_addr: usize,
+    },
 }
 
 struct Variable<'a> {
@@ -192,13 +197,7 @@ pub struct VmContext<
     // locals[0..current_function_objects[0]] == global context.
     stack: ArrayVec<Variable<'a>, STACK_SIZE>,
 
-    // We keep track of frame pointers to know where to return to after a function call.
-    frame_pointers: ArrayVec<usize, MAX_CALL_DEPTH>,
-    // keep track of the number of objects in the current function to know how many to pop when returning.
-    // Index 0 is global context, containing number of global variables + functions
-    current_function_objects: ArrayVec<usize, MAX_CALL_DEPTH>,
-
-    // We also need to keep track of loop frames for break/continue statements.
+    // We keep track of block/loop/function frames.
     scope_stack: ArrayVec<BlockScope, MAX_SCOPE_DEPTH>,
     current_block_scope: ArrayVec<usize, MAX_SCOPE_DEPTH>,
 
@@ -230,8 +229,6 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
     pub fn new_with_modules(script: &'a [u8], module_resolver: Option<ModuleResolver<'a>>) -> Self {
         let mut vm = Self {
             stack: ArrayVec::new_const(),
-            frame_pointers: ArrayVec::new_const(),
-            current_function_objects: ArrayVec::new_const(),
             scope_stack: ArrayVec::new_const(),
             current_block_scope: ArrayVec::new_const(),
             tokenizer: Tokenizer::new(script),
@@ -241,8 +238,9 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         };
         // global context starts with 0 objects
         unsafe {
-            // SAFETY: works since MAX_CALL_DEPTH > 0, asserted above
-            vm.current_function_objects.push_unchecked(0);
+            // SAFETY: works since MAX_SCOPE_DEPTH > 0, asserted above
+            // We use BlockScope::Normal to represent the global scope
+            vm.scope_stack.push_unchecked(BlockScope::Normal);
             vm.current_block_scope.push_unchecked(0);
         }
         vm
@@ -347,14 +345,20 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                     self.scope_stack
                         .try_push(BlockScope::If)
                         .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    self.current_block_scope
+                        .try_push(0)
+                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
                 } else {
                     // Skip block, expect else
                     self.skip_block()?;
                     self.consume_token(&Token::Else)?;
+                    self.consume_token(&Token::OpenBrace)?;
                     self.scope_stack
                         .try_push(BlockScope::Else)
                         .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                    self.consume_token(&Token::OpenBrace)?;
+                    self.current_block_scope
+                        .try_push(0)
+                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
                 }
 
                 // Now we are in the correct block
@@ -365,6 +369,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             (Token::Return, _) => {
                 // Empty, separator, or expression
                 unimplemented!("return statements")
+                // TODO: similar to block pop, but do until we find a function
             }
             (Token::While, _) => {
                 // while + condition
@@ -378,12 +383,22 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             (Token::CloseBrace, _) => {
                 // Blocks
 
+                // Consume the brace
+                self.tokenizer.advance();
+
                 // pop one off the scope stack?
                 let Some(block) = self.scope_stack.pop() else {
                     return Err(InterpreterError::ScopeStackEmpty);
                 };
 
-                if block == BlockScope::If && self.tokenizer.peek() == Token::Else {
+                // The count for the block we just popped
+                let var_count = self
+                    .current_block_scope
+                    .pop()
+                    .ok_or(InterpreterError::ScopeStackEmpty)?;
+
+                let next = self.tokenizer.peek();
+                if block == BlockScope::If && next == Token::Else {
                     // We executed the if, so we skip the else block
                     self.tokenizer.advance();
                     self.consume_token(&Token::OpenBrace)?;
@@ -391,17 +406,13 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                 }
 
                 // Delete scope-specific variables
-                for _ in 0..self.current_block_scope[self.scope_stack.len()] {
+                for _ in 0..var_count {
                     self.stack
                         .pop()
                         .ok_or(InterpreterError::ScopeVariableMismatch)?;
                 }
-                // Keep function scope in sync
-                self.current_function_objects[self.frame_pointers.len()] -=
-                    self.current_block_scope[self.scope_stack.len()];
-                self.current_block_scope[self.scope_stack.len()] = 0;
             }
-            (Token::Eof, _) => return Ok(false),
+            (Token::Separator, Token::Eof) | (Token::Eof, _) => return Ok(false),
             // Anything else is just an expression, e.g. a function call
             _ => {
                 // Expression
@@ -448,18 +459,38 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             return Err(InterpreterError::StackOverflow);
         }
 
-        // First, we check if we can find the variable in the current function stack.
-        // current_function_objects[frame_ptr] tells us how many variables are in the current function, and we only search those.
-        let locals_count = self.current_function_objects[self.frame_pointers.len()];
-        let locals_range = ((self.stack.len() - locals_count)..self.stack.len()).rev();
+        // 1. Calculate the number of variables in the current function scope.
+        // We iterate backwards through scopes, summing variable counts until we hit a Function boundary.
+        let mut locals_count = 0;
+        let mut is_inside_function = false;
 
-        // Additionally, we also look at the global context (frame 0)
-        let globals_range = if self.frame_pointers.len() > 0 {
-            (0..self.current_function_objects[0]).rev()
+        for (scope, &count) in self
+            .scope_stack
+            .iter()
+            .zip(self.current_block_scope.iter())
+            .rev()
+        {
+            locals_count += count;
+            if matches!(scope, BlockScope::Function { .. }) {
+                is_inside_function = true;
+                break;
+            }
+        }
+
+        let stack_len = self.stack.len();
+        let locals_range = (stack_len - locals_count..stack_len).rev();
+
+        // 2. Determine global range.
+        // We only check globals explicitly if we are currently inside a function.
+        // If we are at the top level, `locals_range` already covers the global variables.
+        let globals_range = if is_inside_function {
+            let global_count = *self.current_block_scope.first().unwrap_or(&0);
+            (0..global_count).rev()
         } else {
             (0..0).rev()
         };
 
+        // 3. Perform the search and update (Borrow Checker Safe: we are iterating indices, not references to self)
         for i in locals_range.chain(globals_range) {
             if self.stack[i].name == name {
                 self.stack[i].value = value;
@@ -467,12 +498,17 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             }
         }
 
+        // 4. Not found: Insert new variable into current scope
         unsafe {
             // SAFETY: checked at function start
             self.stack.push_unchecked(Variable { name, value });
         };
-        self.current_block_scope[self.scope_stack.len()] += 1;
-        self.current_function_objects[self.frame_pointers.len() - 1] += 1;
+
+        // Update the count for the current specific block (top of the scope stack)
+        if let Some(last) = self.current_block_scope.last_mut() {
+            *last += 1;
+        }
+
         Ok(())
     }
 
@@ -480,19 +516,36 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         &mut self,
         name: &'a [u8],
     ) -> Result<&mut EngineObject<'a>, InterpreterError<'a>> {
-        // We look for the variable in the current function stack first, then global context if not found.
-        let locals_count = self.current_function_objects[self.frame_pointers.len()];
-        let locals_range = ((self.stack.len() - locals_count)..self.stack.len()).rev();
+        let mut current_stack_index = self.stack.len();
 
-        let globals_range = if self.frame_pointers.len() > 0 {
-            (0..self.current_function_objects[0]).rev()
-        } else {
-            (0..0).rev()
-        };
+        // Look in current function stack first
+        for (scope, &count) in self
+            .scope_stack
+            .iter()
+            .zip(self.current_block_scope.iter())
+            .rev()
+        {
+            let start = current_stack_index - count;
+            let end = current_stack_index;
+            current_stack_index = start;
 
-        for i in locals_range.chain(globals_range) {
-            if self.stack[i].name == name {
-                return Ok(&mut self.stack[i].value);
+            for i in (start..end).rev() {
+                if self.stack[i].name == name {
+                    return Ok(&mut self.stack[i].value);
+                }
+            }
+
+            if let BlockScope::Function { .. } = scope {
+                break;
+            }
+        }
+
+        // Fallback to global context
+        if let Some(&global_count) = self.current_block_scope.first() {
+            for i in (0..global_count).rev() {
+                if self.stack[i].name == name {
+                    return Ok(&mut self.stack[i].value);
+                }
             }
         }
 
@@ -899,6 +952,7 @@ mod tests {
     fn if_else() {
         let mut vm: VmContext<'_> = VmContext::new(
             br#"a = 5;
+            b = 0;
             if a > 3 {
                 b = 10;
             } else {

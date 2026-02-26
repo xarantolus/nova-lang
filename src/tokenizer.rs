@@ -49,6 +49,7 @@ pub(crate) struct Tokenizer<'a> {
     input: &'a [u8],
     cursor: usize,
     last_token: Option<Token<'a>>,
+    // TODO: track comments, maybe with #
 }
 
 impl<'a> Tokenizer<'a> {
