@@ -33,8 +33,11 @@ pub enum Token<'a> {
     Identifier(&'a [u8]),
     Integer(u32),
 
-    // Note: currently not unescaped, as that would require allocation
-    StringLit(&'a [u8]),
+    // Note: string content is still escaped, as that would require allocation
+    StringLit {
+        content: &'a [u8],
+        has_escape_characters: bool,
+    },
 
     // Special
     Eof,
@@ -172,7 +175,11 @@ impl<'a> Tokenizer<'a> {
                 // --- String Literals ---
                 b'"' => {
                     let content_start = cursor;
+                    let mut has_escape_characters = false;
                     while cursor < input.len() && input[cursor] != b'"' {
+                        if input[cursor] == b'\\' {
+                            has_escape_characters = true;
+                        }
                         cursor += 1;
                     }
 
@@ -182,7 +189,18 @@ impl<'a> Tokenizer<'a> {
 
                     let s = &input[content_start..cursor];
                     cursor += 1; // Skip closing quote
-                    return (Token::StringLit(s), cursor, Some(Token::StringLit(s)));
+                    // Store escape info in a tuple (slice, bool)
+                    return (
+                        Token::StringLit {
+                            content: s,
+                            has_escape_characters,
+                        },
+                        cursor,
+                        Some(Token::StringLit {
+                            content: s,
+                            has_escape_characters,
+                        }),
+                    );
                 }
 
                 // --- Numbers (Integers) ---

@@ -13,10 +13,29 @@ pub enum EngineObject<'a> {
     // A simple integer value.
     Int(u32),
     // A string literal. Note that it is still escaped, so we need to unescape it before using it.
-    Str(&'a [u8]),
+    // TODO: maybe include info on whether to escape somehow, or even check that in the tokenizer?
+    StringLiteral(&'a [u8]),
     Unit,
 }
 
+#[cfg(test)]
+impl<'a> Into<EngineObject<'a>> for u32 {
+    fn into(self) -> EngineObject<'a> {
+        EngineObject::Int(self)
+    }
+}
+
+#[cfg(test)]
+impl Into<u32> for EngineObject<'_> {
+    fn into(self) -> u32 {
+        match self {
+            EngineObject::Int(i) => i,
+            _ => panic!("Expected Int"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InterpreterError<'a> {
     UnexpectedToken {
         expected: Token<'a>,
@@ -99,7 +118,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
         // 1. Peek at the next token to decide the statement type
         let token = self.tokenizer.peek();
 
-        match token {}
+        // match token {}
+        unimplemented!()
     }
 
     /// Consumes next tokens, ensuring it is the expected one, otherwise returns an error.
@@ -178,9 +198,11 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
         None
     }
 
-    fn eval_expr(&mut self, min_bp: u8) -> Result<u32, InterpreterError> {}
+    fn eval_expr(&mut self, min_bp: u8) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        unimplemented!()
+    }
 
-    fn skip_block(&mut self) -> Result<(), InterpreterError> {
+    fn skip_block(&mut self) -> Result<(), InterpreterError<'a>> {
         let mut depth = 1; // We assume we just passed the opening '{' (or are about to)
 
         while depth > 0 {
