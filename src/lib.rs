@@ -130,6 +130,25 @@ impl<'a> TryInto<i32> for EngineObject<'a> {
     }
 }
 
+impl<'a> Into<EngineObject<'a>> for bool {
+    fn into(self) -> EngineObject<'a> {
+        EngineObject::Bool(self)
+    }
+}
+
+impl<'a> TryInto<bool> for EngineObject<'a> {
+    type Error = InterpreterError<'a>;
+
+    fn try_into(self) -> Result<bool, Self::Error> {
+        match self {
+            EngineObject::Bool(b) => Ok(b),
+            _ => Err(InterpreterError::InvalidConversion {
+                from: self,
+                to: "bool",
+            }),
+        }
+    }
+}
 #[derive(PartialEq, Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
@@ -158,9 +177,10 @@ pub enum InterpreterError<'a> {
     ScopeVariableMismatch,
     ScopeStackEmpty,
     ScopeStackExhausted,
-    ExpressionStackExhausted,
+    ExpressionStackEmpty,
+    ExpressionStackOverflow,
     TooManySteps,
-    StackOverflow,
+    ObjectStackOverflow,
     UnexpectedEoF,
 }
 
@@ -411,6 +431,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         .pop()
                         .ok_or(InterpreterError::ScopeVariableMismatch)?;
                 }
+
+                self.consume_separator()?;
             }
             (Token::Separator, Token::Eof) | (Token::Eof, _) => return Ok(false),
             // Anything else is just an expression, e.g. a function call
@@ -456,7 +478,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         value: EngineObject<'a>,
     ) -> Result<(), InterpreterError<'a>> {
         if self.stack.len() >= STACK_SIZE {
-            return Err(InterpreterError::StackOverflow);
+            return Err(InterpreterError::ObjectStackOverflow);
         }
 
         // 1. Calculate the number of variables in the current function scope.
@@ -563,7 +585,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                     Token::IntegerLit(i) => {
                         self.expression_stack
                             .try_push(EngineObject::Int(i))
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
 
                         expect_operand = false;
                     }
@@ -576,7 +598,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                                 content,
                                 has_escape_characters,
                             })
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
 
                         expect_operand = false;
                     }
@@ -584,7 +606,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         let var = self.get_var(id)?.clone();
                         self.expression_stack
                             .try_push(var)
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
 
                         expect_operand = false;
                     }
@@ -592,7 +614,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         // Push sentinel with 0 precedence so nothing pops it until RParen
                         self.expression_operator_stack
                             .try_push((Token::OpenParen, 0))
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
 
                         // we don't change expect_operand here!
                     }
@@ -600,7 +622,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                     Token::Bang => {
                         self.expression_operator_stack
                             .try_push((Token::Bang, 255)) // highest precedence for unary ops
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     }
                     Token::Plus => {
                         // Can be ignored
@@ -609,10 +631,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         // push a "0-..." onto the stack, to turn unary minus into binary
                         self.expression_stack
                             .try_push(EngineObject::Int(0))
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                         self.expression_operator_stack
                             .try_push((Token::Minus, 255)) // highest precedence for unary ops
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     }
                     token => {
                         return Err(InterpreterError::InvalidExpression(token));
@@ -645,7 +667,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         let _ = self.consume_token(&op)?;
                         self.expression_operator_stack
                             .try_push((op, rbp))
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
 
                         expect_operand = true;
                     }
@@ -664,13 +686,13 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         self.consume_token(&Token::Dot)?;
                         self.expression_operator_stack
                             .try_push((Token::Dot, lbp))
-                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                         match self.tokenizer.advance() {
                             Token::Identifier(id) => {
                                 // We push the name as a StringLiteral so `pop_and_apply` can use it
                                 self.expression_stack
                                     .try_push(EngineObject::MemberAccess { name: id })
-                                    .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                                    .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                             }
                             t => {
                                 return Err(InterpreterError::UnexpectedToken {
@@ -682,7 +704,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         expect_operand = false;
                     }
                     Token::CloseParen => {
-                        // Execute everything back to the LParen
+                        // Execute everything back to the OpenParen
                         while initial_ops_stack_len < self.expression_operator_stack.len()
                             && let Some((top_op, _)) = self.expression_operator_stack.last()
                         {
@@ -711,7 +733,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
 
         self.expression_stack
             .pop()
-            .ok_or(InterpreterError::InvalidExpression(Token::Eof))
+            .ok_or(InterpreterError::ExpressionStackEmpty)
     }
 
     fn pop_and_apply(&mut self) -> Result<(), InterpreterError<'a>> {
@@ -719,7 +741,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         let right = self
             .expression_stack
             .pop()
-            .ok_or(InterpreterError::InvalidExpression(Token::Eof))?;
+            .ok_or(InterpreterError::ExpressionStackEmpty)?;
 
         match op {
             // Unary operators
@@ -727,12 +749,12 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                 if let EngineObject::Bool(b) = right {
                     self.expression_stack
                         .try_push(EngineObject::Bool(!b))
-                        .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                        .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     return Ok(());
                 } else if let EngineObject::Int(i) = right {
                     self.expression_stack
                         .try_push(EngineObject::Int(if i == 0 { 1 } else { 0 }))
-                        .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                        .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     return Ok(());
                 } else {
                     return Err(InterpreterError::InvalidUnaryOperation { op, obj: right });
@@ -746,7 +768,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         let mut left = self
             .expression_stack
             .pop()
-            .ok_or(InterpreterError::InvalidExpression(Token::Eof))?;
+            .ok_or(InterpreterError::ExpressionStackEmpty)?;
 
         match (&mut left, op, &right) {
             // Integer math
@@ -800,15 +822,15 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
 
         self.expression_stack
             .try_push(left)
-            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
         Ok(())
     }
 
-    fn infix_binding_power(&self, token: &Token) -> Option<(u8, u8)> {
+    const fn infix_binding_power(&self, token: &Token) -> Option<(u8, u8)> {
         match token {
-            Token::Plus | Token::Minus => Some((1, 2)), // left bp, right bp
-            Token::Star | Token::Slash => Some((3, 4)),
-            Token::Equals | Token::Lt | Token::Gt | Token::Lte | Token::Gte => Some((0, 1)),
+            Token::Plus | Token::Minus => Some((2, 3)), // left bp, right bp
+            Token::Star | Token::Slash => Some((4, 5)),
+            Token::Equals | Token::Lt | Token::Gt | Token::Lte | Token::Gte => Some((1, 2)),
             _ => None,
         }
     }
@@ -881,6 +903,12 @@ mod tests {
     }
 
     #[test]
+    fn comparison_operators() {
+        let mut vm: VmContext<'_> = VmContext::new(b"(1 < 8)");
+        assert_eq!(vm.eval_expr().unwrap(), true.into());
+    }
+
+    #[test]
     fn unary_operators() {
         let mut vm: VmContext<'_> = VmContext::new(b"-5");
         assert_eq!(vm.eval_expr().unwrap(), (-5).into());
@@ -916,7 +944,10 @@ mod tests {
         // Limit stack to at most 2 variables
         let mut vm: VmContext<'_, 2, 16, 8, 16> =
             VmContext::new(b"a = 5 + 5; b = a + 5; c = b + a;");
-        assert!(matches!(vm.run(), Err(InterpreterError::StackOverflow)));
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::ObjectStackOverflow)
+        ));
     }
 
     #[test]
@@ -957,6 +988,36 @@ mod tests {
                 b = 10;
             } else {
                 b = 20;
+            }
+        "#,
+        );
+        vm.run().expect("Running VM with if-else");
+        assert_eq!(*vm.get_var(b"b").unwrap(), 10.into());
+    }
+
+    #[test]
+    fn if_only() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br#"a = 5;
+            b = 0;
+            if a > 3 {
+                b = 10;
+            }
+        "#,
+        );
+        vm.run().expect("Running VM with if-else");
+        assert_eq!(*vm.get_var(b"b").unwrap(), 10.into());
+    }
+
+    #[test]
+    fn if_nested() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br#"a = 5;
+            b = 0;
+            if a > 3 {
+                if (a < 10) {
+                    b = 10;
+                }
             }
         "#,
         );
