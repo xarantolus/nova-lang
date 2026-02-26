@@ -44,7 +44,7 @@ pub enum Token<'a> {
     Error,
 }
 
-pub struct Tokenizer<'a> {
+pub(crate) struct Tokenizer<'a> {
     input: &'a [u8],
     cursor: usize,
     last_token: Option<Token<'a>>,

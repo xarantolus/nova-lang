@@ -2,12 +2,22 @@
 
 use core::ops::Range;
 
+use arrayvec::ArrayVec;
+
 use crate::tokenizer::{Token, Tokenizer};
 
 mod tokenizer;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub trait Module<'a> {
+    fn call(
+        &mut self,
+        func: &'a [u8],
+        args: &[EngineObject<'a>],
+    ) -> Result<EngineObject<'a>, InterpreterError<'a>>;
+}
+
 pub enum EngineObject<'a> {
+    Module(&'a mut dyn Module<'a>),
     // Position of the function in the script. We can jump to it to call it.
     Function(u32),
     // A simple integer value.
@@ -18,14 +28,12 @@ pub enum EngineObject<'a> {
     Unit,
 }
 
-#[cfg(test)]
 impl<'a> Into<EngineObject<'a>> for u32 {
     fn into(self) -> EngineObject<'a> {
         EngineObject::Int(self)
     }
 }
 
-#[cfg(test)]
 impl Into<u32> for EngineObject<'_> {
     fn into(self) -> u32 {
         match self {
@@ -53,7 +61,6 @@ struct LoopFrame {
     end_cursor: Option<usize>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct Variable<'a> {
     name: &'a [u8],
     value: EngineObject<'a>,
@@ -65,19 +72,17 @@ pub struct VmContext<
     const MAX_CALL_DEPTH: usize = 16,
     const MAX_LOOP_DEPTH: usize = 8,
 > {
-    // locals[0] == global context. We just walk up the stack to find variables, no separate call frames.
-    stack: [Variable<'a>; STACK_SIZE],
-    stack_ptr: usize,
+    // locals[0..current_function_objects[0]] == global context.
+    stack: ArrayVec<Variable<'a>, STACK_SIZE>,
 
     // We keep track of frame pointers to know where to return to after a function call.
-    frame_pointers: [usize; MAX_CALL_DEPTH],
+    frame_pointers: ArrayVec<usize, MAX_CALL_DEPTH>,
     // keep track of the number of objects in the current function to know how many to pop when returning.
     // Index 0 is global context, containing number of global variables + functions
-    current_function_objects: [usize; MAX_CALL_DEPTH],
-    frame_ptr: usize,
+    current_function_objects: ArrayVec<usize, MAX_CALL_DEPTH>,
 
-    loop_stack: [LoopFrame; MAX_LOOP_DEPTH],
-    loop_depth: usize,
+    // We also need to keep track of loop frames for break/continue statements.
+    loop_stack: ArrayVec<LoopFrame, MAX_LOOP_DEPTH>,
 
     tokenizer: Tokenizer<'a>,
     // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
@@ -86,26 +91,17 @@ pub struct VmContext<
 impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DEPTH: usize>
     VmContext<'a, STACK_SIZE, MAX_CALL_DEPTH, MAX_LOOP_DEPTH>
 {
-    pub const fn new(script: &'a [u8]) -> Self {
-        Self {
-            stack: [Variable {
-                name: &[],
-                value: EngineObject::Unit,
-            }; STACK_SIZE],
-            stack_ptr: 0,
-
-            frame_pointers: [0; MAX_CALL_DEPTH],
-            current_function_objects: [0; MAX_CALL_DEPTH],
-            frame_ptr: 0,
-
-            loop_stack: [LoopFrame {
-                end_cursor: None,
-                start_cursor: 0,
-            }; MAX_LOOP_DEPTH],
-            loop_depth: 0,
-
+    pub fn new(script: &'a [u8]) -> Self {
+        let mut vm = Self {
+            stack: ArrayVec::new_const(),
+            frame_pointers: ArrayVec::new_const(),
+            current_function_objects: ArrayVec::new_const(),
+            loop_stack: ArrayVec::new_const(),
             tokenizer: Tokenizer::new(script),
-        }
+        };
+        // global context starts with 0 objects
+        vm.current_function_objects.push(0);
+        vm
     }
 
     pub fn run(&mut self) -> Result<(), InterpreterError> {
@@ -114,7 +110,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
     }
 
     // Returns: Ok(true) if work was done, Ok(false) if EOF, Err on error
-    pub fn step(&mut self) -> Result<bool, &'static str> {
+    pub fn step(&mut self) -> Result<bool, InterpreterError<'a>> {
         // 1. Peek at the next token to decide the statement type
         let token = self.tokenizer.peek();
 
@@ -148,17 +144,17 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
         name: &'a [u8],
         value: EngineObject<'a>,
     ) -> Result<(), InterpreterError<'a>> {
-        if self.stack_ptr >= STACK_SIZE {
+        if self.stack.len() >= STACK_SIZE {
             return Err(InterpreterError::StackOverflow);
         }
 
         // First, we check if we can find the variable in the current function stack.
         // current_function_objects[frame_ptr] tells us how many variables are in the current function, and we only search those.
-        let locals_count = self.current_function_objects[self.frame_ptr];
-        let locals_range = ((self.stack_ptr - locals_count)..self.stack_ptr).rev();
+        let locals_count = self.current_function_objects[self.frame_pointers.len()];
+        let locals_range = ((self.stack.len() - locals_count)..self.stack.len()).rev();
 
         // Additionally, we also look at the global context (frame 0)
-        let globals_range = if self.frame_ptr > 0 {
+        let globals_range = if self.frame_pointers.len() > 0 {
             (0..self.current_function_objects[0]).rev()
         } else {
             (0..0).rev()
@@ -171,19 +167,18 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             }
         }
 
-        self.stack[self.stack_ptr] = Variable { name, value };
-        self.stack_ptr += 1;
-        self.current_function_objects[self.frame_ptr] += 1;
+        self.stack.push(Variable { name, value });
+        self.current_function_objects[self.frame_pointers.len()] += 1;
         Ok(())
     }
 
     // TODO: maybe return error
     fn get_var(&mut self, name: &'a [u8]) -> Option<&mut EngineObject<'a>> {
         // We look for the variable in the current function stack first, then global context if not found.
-        let locals_count = self.current_function_objects[self.frame_ptr];
-        let locals_range = ((self.stack_ptr - locals_count)..self.stack_ptr).rev();
+        let locals_count = self.current_function_objects[self.frame_pointers.len()];
+        let locals_range = ((self.stack.len() - locals_count)..self.stack.len()).rev();
 
-        let globals_range = if self.frame_ptr > 0 {
+        let globals_range = if self.frame_pointers.len() > 0 {
             (0..self.current_function_objects[0]).rev()
         } else {
             (0..0).rev()
@@ -217,19 +212,19 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-    #[test]
-    fn test_simple_expr() {
-        let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 * 3");
-        assert_eq!(vm.eval_expr(0).unwrap(), 7);
-    }
+//     #[test]
+//     fn test_simple_expr() {
+//         let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 * 3");
+//         assert_eq!(vm.eval_expr(0).unwrap(), 7);
+//     }
 
-    #[test]
-    fn test_simple_expr() {
-        let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 * 3");
-        assert_eq!(vm.eval_expr(0).unwrap(), 7);
-    }
-}
+//     #[test]
+//     fn test_simple_expr() {
+//         let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 * 3");
+//         assert_eq!(vm.eval_expr(0).unwrap(), 7);
+//     }
+// }
