@@ -6,10 +6,10 @@ pub enum Token<'a> {
     Else,
     Return,
     While,
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
+    OpenParen,
+    CloseParen,
+    OpenBrace,
+    CloseBrace,
     Comma,
     Dot,
 
@@ -122,10 +122,10 @@ impl<'a> Tokenizer<'a> {
             cursor += 1;
 
             match c {
-                b'(' => return (Token::LParen, cursor, Some(Token::LParen)),
-                b')' => return (Token::RParen, cursor, Some(Token::RParen)),
-                b'{' => return (Token::LBrace, cursor, Some(Token::LBrace)),
-                b'}' => return (Token::RBrace, cursor, Some(Token::RBrace)),
+                b'(' => return (Token::OpenParen, cursor, Some(Token::OpenParen)),
+                b')' => return (Token::CloseParen, cursor, Some(Token::CloseParen)),
+                b'{' => return (Token::OpenBrace, cursor, Some(Token::OpenBrace)),
+                b'}' => return (Token::CloseBrace, cursor, Some(Token::CloseBrace)),
                 b',' => return (Token::Comma, cursor, Some(Token::Comma)),
 
                 b';' | b'\n' => {
@@ -142,7 +142,7 @@ impl<'a> Tokenizer<'a> {
                     let is_at_start = input[..start].iter().all(|b| b.is_ascii_whitespace());
 
                     // Only emit separator if not after LBrace or at start
-                    if is_at_start || matches!(last_token, Some(Token::LBrace)) {
+                    if is_at_start || matches!(last_token, Some(Token::OpenBrace)) {
                         continue; // Skip this separator
                     }
 
@@ -301,9 +301,9 @@ mod tests {
                 Token::IntegerLit(5),
                 Token::Separator,
                 Token::Identifier(b"print"),
-                Token::LParen,
+                Token::OpenParen,
                 Token::IntegerLit(5),
-                Token::RParen,
+                Token::CloseParen,
                 Token::Separator,
             ],
         );
@@ -328,21 +328,21 @@ mod tests {
                 Token::Identifier(b"a"),
                 Token::Lt,
                 Token::IntegerLit(10),
-                Token::LBrace,
+                Token::OpenBrace,
                 Token::Identifier(b"a"),
                 Token::Assign,
                 Token::Identifier(b"a"),
                 Token::Plus,
                 Token::IntegerLit(1),
                 Token::Separator,
-                Token::RBrace,
+                Token::CloseBrace,
                 Token::Separator,
                 Token::Identifier(b"print"),
-                Token::LParen,
+                Token::OpenParen,
                 Token::Identifier(b"a"),
                 Token::Plus,
                 Token::IntegerLit(1),
-                Token::RParen,
+                Token::CloseParen,
                 Token::Separator,
             ],
         );

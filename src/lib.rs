@@ -51,6 +51,16 @@ pub enum EngineObject<'a> {
     Unit,
 }
 
+impl<'a> EngineObject<'a> {
+    fn is_true(&self) -> Result<bool, InterpreterError<'a>> {
+        match self {
+            Self::Bool(b) => Ok(*b),
+            Self::Int(i) => Ok(*i != 0),
+            _ => Err(InterpreterError::InvalidExpressionResult { obj: self.clone() }),
+        }
+    }
+}
+
 impl PartialEq for EngineObject<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -124,6 +134,9 @@ impl<'a> TryInto<i32> for EngineObject<'a> {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
     NameError(&'a [u8]),
+    InvalidExpressionResult {
+        obj: EngineObject<'a>,
+    },
     InvalidUnaryOperation {
         op: Token<'a>,
         obj: EngineObject<'a>,
@@ -142,18 +155,26 @@ pub enum InterpreterError<'a> {
         expected: Token<'a>,
         found: Token<'a>,
     },
+    ScopeVariableMismatch,
+    ScopeStackEmpty,
+    ScopeStackExhausted,
     ExpressionStackExhausted,
     TooManySteps,
     StackOverflow,
     UnexpectedEoF,
 }
 
-#[derive(Clone, Copy, Default)]
-struct LoopFrame {
-    start_cursor: usize,
-    // optimization for loops that have at least one iteration
-    // if we end the loop and already know the end cursor, we can jump there directly instead of having to scan the block
-    end_cursor: Option<usize>,
+#[derive(PartialEq)]
+enum BlockScope {
+    Normal,
+    While {
+        // position is the position of the while expression
+        position: usize,
+        // position after the end brace, if known
+        end_position: Option<usize>,
+    },
+    If,
+    Else,
 }
 
 struct Variable<'a> {
@@ -165,7 +186,7 @@ pub struct VmContext<
     'a,
     const STACK_SIZE: usize = 32,
     const MAX_CALL_DEPTH: usize = 16,
-    const MAX_LOOP_DEPTH: usize = 8,
+    const MAX_SCOPE_DEPTH: usize = 8,
     const MAX_EXPRESSION_DEPTH: usize = 16,
 > {
     // locals[0..current_function_objects[0]] == global context.
@@ -178,7 +199,8 @@ pub struct VmContext<
     current_function_objects: ArrayVec<usize, MAX_CALL_DEPTH>,
 
     // We also need to keep track of loop frames for break/continue statements.
-    loop_stack: ArrayVec<LoopFrame, MAX_LOOP_DEPTH>,
+    scope_stack: ArrayVec<BlockScope, MAX_SCOPE_DEPTH>,
+    current_block_scope: ArrayVec<usize, MAX_SCOPE_DEPTH>,
 
     module_resolver: Option<ModuleResolver<'a>>,
 
@@ -190,14 +212,16 @@ pub struct VmContext<
     // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
 }
 
-impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DEPTH: usize>
-    VmContext<'a, STACK_SIZE, MAX_CALL_DEPTH, MAX_LOOP_DEPTH>
+impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_DEPTH: usize>
+    VmContext<'a, STACK_SIZE, MAX_CALL_DEPTH, MAX_SCOPE_DEPTH>
 {
     const _ASSERT_STACK_SIZE: () = assert!(STACK_SIZE > 0, "STACK_SIZE must be greater than 0");
     const _ASSERT_MAX_CALL_DEPTH: () =
         assert!(MAX_CALL_DEPTH > 0, "MAX_CALL_DEPTH must be greater than 0");
-    const _ASSERT_MAX_LOOP_DEPTH: () =
-        assert!(MAX_LOOP_DEPTH > 0, "MAX_LOOP_DEPTH must be greater than 0");
+    const _ASSERT_MAX_SCOPE_DEPTH: () = assert!(
+        MAX_SCOPE_DEPTH > 0,
+        "MAX_SCOPE_DEPTH must be greater than 0"
+    );
 
     pub fn new(script: &'a [u8]) -> Self {
         Self::new_with_modules(script, None)
@@ -208,7 +232,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             stack: ArrayVec::new_const(),
             frame_pointers: ArrayVec::new_const(),
             current_function_objects: ArrayVec::new_const(),
-            loop_stack: ArrayVec::new_const(),
+            scope_stack: ArrayVec::new_const(),
+            current_block_scope: ArrayVec::new_const(),
             tokenizer: Tokenizer::new(script),
             expression_operator_stack: ArrayVec::new_const(),
             expression_stack: ArrayVec::new_const(),
@@ -218,6 +243,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
         unsafe {
             // SAFETY: works since MAX_CALL_DEPTH > 0, asserted above
             vm.current_function_objects.push_unchecked(0);
+            vm.current_block_scope.push_unchecked(0);
         }
         vm
     }
@@ -267,7 +293,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             (Token::Fn, Token::Identifier(function_name)) => {
                 self.consume_token(&Token::Fn)?;
                 self.tokenizer.advance();
-                self.consume_token(&Token::LParen)?;
+                self.consume_token(&Token::OpenParen)?;
                 let function_pos = self.tokenizer.cursor_pos();
 
                 let mut nargs = 0;
@@ -283,7 +309,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                         Token::Comma if !next_ident => {
                             next_ident = true;
                         }
-                        Token::RParen if (!next_ident || nargs == 0) => break,
+                        Token::CloseParen if (!next_ident || nargs == 0) => break,
                         tok => {
                             return Err(InterpreterError::UnexpectedToken {
                                 expected: if next_ident {
@@ -297,7 +323,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                     }
                 }
 
-                self.consume_token(&Token::LBrace)?;
+                self.consume_token(&Token::OpenBrace)?;
 
                 self.skip_block()?;
 
@@ -312,8 +338,29 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                 )?;
             }
             (Token::If, _) => {
-                // After if comes an expression
-                unimplemented!("if statements")
+                self.tokenizer.advance();
+                let expression_res = self.eval_expr()?.is_true()?;
+
+                self.consume_token(&Token::OpenBrace)?;
+
+                if expression_res {
+                    self.scope_stack
+                        .try_push(BlockScope::If)
+                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                } else {
+                    // Skip block, expect else
+                    self.skip_block()?;
+                    self.consume_token(&Token::Else)?;
+                    self.scope_stack
+                        .try_push(BlockScope::Else)
+                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    self.consume_token(&Token::OpenBrace)?;
+                }
+
+                // Now we are in the correct block
+            }
+            (Token::Else, _) => {
+                // Honest just check if our block is the correct type? Basically combine loop + if + blocks into one stack?
             }
             (Token::Return, _) => {
                 // Empty, separator, or expression
@@ -323,13 +370,36 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                 // while + condition
                 unimplemented!("while")
             }
-            (Token::LParen, _) => {
+            (Token::OpenParen, _) => {
                 // Expressions
                 unimplemented!("expressions")
             }
-            (Token::LBrace, _) => {
+            (Token::OpenBrace, _) => {}
+            (Token::CloseBrace, _) => {
                 // Blocks
-                unimplemented!("blocks")
+
+                // pop one off the scope stack?
+                let Some(block) = self.scope_stack.pop() else {
+                    return Err(InterpreterError::ScopeStackEmpty);
+                };
+
+                if block == BlockScope::If && self.tokenizer.peek() == Token::Else {
+                    // We executed the if, so we skip the else block
+                    self.tokenizer.advance();
+                    self.consume_token(&Token::OpenBrace)?;
+                    self.skip_block()?;
+                }
+
+                // Delete scope-specific variables
+                for _ in 0..self.current_block_scope[self.scope_stack.len()] {
+                    self.stack
+                        .pop()
+                        .ok_or(InterpreterError::ScopeVariableMismatch)?;
+                }
+                // Keep function scope in sync
+                self.current_function_objects[self.frame_pointers.len()] -=
+                    self.current_block_scope[self.scope_stack.len()];
+                self.current_block_scope[self.scope_stack.len()] = 0;
             }
             (Token::Eof, _) => return Ok(false),
             // Anything else is just an expression, e.g. a function call
@@ -401,7 +471,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             // SAFETY: checked at function start
             self.stack.push_unchecked(Variable { name, value });
         };
-        self.current_function_objects[self.frame_pointers.len()] += 1;
+        self.current_block_scope[self.scope_stack.len()] += 1;
+        self.current_function_objects[self.frame_pointers.len() - 1] += 1;
         Ok(())
     }
 
@@ -464,10 +535,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
 
                         expect_operand = false;
                     }
-                    Token::LParen => {
+                    Token::OpenParen => {
                         // Push sentinel with 0 precedence so nothing pops it until RParen
                         self.expression_operator_stack
-                            .try_push((Token::LParen, 0))
+                            .try_push((Token::OpenParen, 0))
                             .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
 
                         // we don't change expect_operand here!
@@ -557,23 +628,23 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                         }
                         expect_operand = false;
                     }
-                    Token::RParen => {
+                    Token::CloseParen => {
                         // Execute everything back to the LParen
                         while initial_ops_stack_len < self.expression_operator_stack.len()
                             && let Some((top_op, _)) = self.expression_operator_stack.last()
                         {
-                            if *top_op == Token::LParen {
+                            if *top_op == Token::OpenParen {
                                 break;
                             }
                             self.pop_and_apply()?;
                         }
 
                         if self.expression_operator_stack.pop().map(|(t, _)| t)
-                            != Some(Token::LParen)
+                            != Some(Token::OpenParen)
                         {
-                            return Err(InterpreterError::InvalidExpression(Token::RParen));
+                            return Err(InterpreterError::InvalidExpression(Token::CloseParen));
                         }
-                        self.consume_token(&Token::RParen)?;
+                        self.consume_token(&Token::CloseParen)?;
                         expect_operand = false;
                     }
                     _ => break,
@@ -625,10 +696,33 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             .ok_or(InterpreterError::InvalidExpression(Token::Eof))?;
 
         match (&mut left, op, &right) {
+            // Integer math
             (EngineObject::Int(l), Token::Plus, EngineObject::Int(r)) => *l += r,
             (EngineObject::Int(l), Token::Minus, EngineObject::Int(r)) => *l -= r,
             (EngineObject::Int(l), Token::Star, EngineObject::Int(r)) => *l *= r,
             (EngineObject::Int(l), Token::Slash, EngineObject::Int(r)) => *l /= r,
+
+            // Comparison operators
+            (EngineObject::Int(l), Token::Equals, EngineObject::Int(r)) => {
+                left = EngineObject::Bool(l == r)
+            }
+            (EngineObject::Int(l), Token::Lt, EngineObject::Int(r)) => {
+                left = EngineObject::Bool(*l < *r)
+            }
+            (EngineObject::Int(l), Token::Gt, EngineObject::Int(r)) => {
+                left = EngineObject::Bool(*l > *r)
+            }
+            (EngineObject::Int(l), Token::Lte, EngineObject::Int(r)) => {
+                left = EngineObject::Bool(*l <= *r)
+            }
+            (EngineObject::Int(l), Token::Gte, EngineObject::Int(r)) => {
+                left = EngineObject::Bool(*l >= *r)
+            }
+
+            // Compare booleans
+            (EngineObject::Bool(l), Token::Equals, EngineObject::Bool(r)) => {
+                left = EngineObject::Bool(l == r)
+            }
 
             // Handle Dot Access
             (EngineObject::Module(m), Token::Dot, EngineObject::MemberAccess { name }) => {
@@ -671,8 +765,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
 
         while depth > 0 {
             match self.tokenizer.advance() {
-                Token::LBrace => depth += 1,
-                Token::RBrace => depth -= 1,
+                Token::OpenBrace => depth += 1,
+                Token::CloseBrace => depth -= 1,
                 Token::Eof => return Err(InterpreterError::UnexpectedEoF),
                 _ => {} // Ignore everything else
             }
@@ -799,5 +893,20 @@ mod tests {
                 num_args: 0
             }
         ));
+    }
+
+    #[test]
+    fn if_else() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br#"a = 5;
+            if a > 3 {
+                b = 10;
+            } else {
+                b = 20;
+            }
+        "#,
+        );
+        vm.run().expect("Running VM with if-else");
+        assert_eq!(*vm.get_var(b"b").unwrap(), 10.into());
     }
 }
