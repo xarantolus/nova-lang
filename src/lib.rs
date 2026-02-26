@@ -384,7 +384,11 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                 // Now we are in the correct block
             }
             (Token::Else, _) => {
-                // Honest just check if our block is the correct type? Basically combine loop + if + blocks into one stack?
+                // If we hit this, we have an else without a matching if...
+                return Err(InterpreterError::UnexpectedToken {
+                    expected: Token::If,
+                    found: Token::Else,
+                });
             }
             (Token::Return, _) => {
                 // Empty, separator, or expression
