@@ -26,12 +26,17 @@ pub enum EngineObject<'a> {
     // Position of the function in the script. We can jump to it to call it.
     Function(u32),
     // A simple integer value.
-    Int(u32),
+    Int(i32),
+    Bool(bool),
     // A string literal.
     // If it contains escape characters, we have to unescape it before using
     StringLiteral {
         content: &'a [u8],
         has_escape_characters: bool,
+    },
+    // e.g. in module.member
+    MemberAccess {
+        name: &'a [u8],
     },
     // An user-defined object. We don't care about its internal structure.
     // Modules should allocate their own memory and return handles representing objects.
@@ -70,6 +75,12 @@ impl core::fmt::Display for EngineObject<'_> {
             EngineObject::Function(pos) => write!(f, "<function@{}>", pos),
             EngineObject::Handle { id, .. } => write!(f, "<handle@{}>", id),
             EngineObject::Unit => write!(f, "void"),
+            EngineObject::MemberAccess { name } => write!(
+                f,
+                "<member_access:{}>",
+                core::str::from_utf8(name).unwrap_or("<invalid utf-8>")
+            ),
+            EngineObject::Bool(b) => write!(f, "{}", b),
         }
     }
 }
@@ -80,14 +91,14 @@ impl core::fmt::Debug for EngineObject<'_> {
     }
 }
 
-impl<'a> Into<EngineObject<'a>> for u32 {
+impl<'a> Into<EngineObject<'a>> for i32 {
     fn into(self) -> EngineObject<'a> {
         EngineObject::Int(self)
     }
 }
 
-impl Into<u32> for EngineObject<'_> {
-    fn into(self) -> u32 {
+impl Into<i32> for EngineObject<'_> {
+    fn into(self) -> i32 {
         match self {
             EngineObject::Int(i) => i,
             _ => panic!("Expected Int"),
@@ -98,6 +109,10 @@ impl Into<u32> for EngineObject<'_> {
 #[derive(Debug, PartialEq, Clone)]
 pub enum InterpreterError<'a> {
     NameError(&'a [u8]),
+    InvalidUnaryOperation {
+        op: Token<'a>,
+        obj: EngineObject<'a>,
+    },
     InvalidOperation {
         op: Token<'a>,
         left: EngineObject<'a>,
@@ -108,6 +123,7 @@ pub enum InterpreterError<'a> {
         expected: Token<'a>,
         found: Token<'a>,
     },
+    ExpressionStackExhausted,
     StackOverflow,
     UnexpectedEoF,
 }
@@ -130,6 +146,7 @@ pub struct VmContext<
     const STACK_SIZE: usize = 32,
     const MAX_CALL_DEPTH: usize = 16,
     const MAX_LOOP_DEPTH: usize = 8,
+    const MAX_EXPRESSION_DEPTH: usize = 16,
 > {
     // locals[0..current_function_objects[0]] == global context.
     stack: ArrayVec<Variable<'a>, STACK_SIZE>,
@@ -144,6 +161,10 @@ pub struct VmContext<
     loop_stack: ArrayVec<LoopFrame, MAX_LOOP_DEPTH>,
 
     module_resolver: Option<ModuleResolver<'a>>,
+
+    // Expression evaluation stacks
+    expression_stack: ArrayVec<EngineObject<'a>, MAX_EXPRESSION_DEPTH>,
+    expression_operator_stack: ArrayVec<(Token<'a>, u8), MAX_EXPRESSION_DEPTH>,
 
     tokenizer: Tokenizer<'a>,
     // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
@@ -163,6 +184,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             current_function_objects: ArrayVec::new_const(),
             loop_stack: ArrayVec::new_const(),
             tokenizer: Tokenizer::new(script),
+            expression_operator_stack: ArrayVec::new_const(),
+            expression_stack: ArrayVec::new_const(),
             module_resolver,
         };
         // global context starts with 0 objects
@@ -185,13 +208,13 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
     }
 
     /// Consumes next tokens, ensuring it is the expected one, otherwise returns an error.
-    fn consume_token(&mut self, expected: Token<'a>) -> Result<(), InterpreterError<'a>> {
+    fn consume_token(&mut self, expected: &Token<'a>) -> Result<(), InterpreterError<'a>> {
         let token = self.tokenizer.advance();
-        if token == expected {
+        if token == *expected {
             Ok(())
         } else {
             Err(InterpreterError::UnexpectedToken {
-                expected,
+                expected: *expected,
                 found: token,
             })
         }
@@ -259,93 +282,215 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
         Err(InterpreterError::NameError(name))
     }
 
-    fn eval_expr(&mut self, min_bp: u8) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-        let mut left = match self.tokenizer.advance() {
-            Token::IntegerLit(i) => EngineObject::Int(i),
-            Token::StringLit {
-                content,
-                has_escape_characters,
-            } => EngineObject::StringLiteral {
-                content,
-                has_escape_characters,
-            },
-            Token::Identifier(id) => self.get_var(id)?.clone(),
-            Token::LParen => {
-                let expr = self.eval_expr(0)?;
-                self.consume_token(Token::RParen)?;
-                expr
-            }
-            token => {
-                return Err(InterpreterError::InvalidExpression(token));
-            }
-        };
+    fn eval_expr(&mut self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        let mut expect_operand = true;
+        let initial_ops_stack_len = self.expression_operator_stack.len();
 
-        Ok(loop {
-            match self.tokenizer.peek() {
-                Token::Equals
-                | Token::Lt
-                | Token::Gt
-                | Token::Lte
-                | Token::Gte
-                | Token::Plus
-                | Token::Minus
-                | Token::Star
-                | Token::Slash => {
-                    let op = self.tokenizer.peek();
-                    let (_, right_bp) = match self.infix_binding_power(&op) {
-                        Some((left_b, right_b)) if left_b >= min_bp => (left_b, right_b),
-                        _ => break left,
-                    };
-                    let op = self.tokenizer.advance();
-                    let right = self.eval_expr(right_bp)?;
+        // We use the VmContext expression stack to prevent actual runtime stack overflows.
+        loop {
+            if expect_operand {
+                match self.tokenizer.advance() {
+                    Token::IntegerLit(i) => {
+                        self.expression_stack
+                            .try_push(EngineObject::Int(i))
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
 
-                    match (left, op, right) {
-                        (EngineObject::Int(lhs), Token::Plus, EngineObject::Int(rhs)) => {
-                            left = EngineObject::Int(lhs + rhs);
-                        }
-                        (EngineObject::Int(lhs), Token::Minus, EngineObject::Int(rhs)) => {
-                            left = EngineObject::Int(lhs - rhs);
-                        }
-                        (EngineObject::Int(lhs), Token::Star, EngineObject::Int(rhs)) => {
-                            left = EngineObject::Int(lhs * rhs);
-                        }
-                        (EngineObject::Int(lhs), Token::Slash, EngineObject::Int(rhs)) => {
-                            left = EngineObject::Int(lhs / rhs);
-                        }
-                        (left, op, right) => {
-                            return Err(InterpreterError::InvalidOperation { op, left, right });
-                        }
+                        expect_operand = false;
+                    }
+                    Token::StringLit {
+                        content,
+                        has_escape_characters,
+                    } => {
+                        self.expression_stack
+                            .try_push(EngineObject::StringLiteral {
+                                content,
+                                has_escape_characters,
+                            })
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+
+                        expect_operand = false;
+                    }
+                    Token::Identifier(id) => {
+                        let var = self.get_var(id)?.clone();
+                        self.expression_stack
+                            .try_push(var)
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+
+                        expect_operand = false;
+                    }
+                    Token::LParen => {
+                        // Push sentinel with 0 precedence so nothing pops it until RParen
+                        self.expression_operator_stack.push((Token::LParen, 0));
+
+                        // we don't change expect_operand here!
+                    }
+                    // Unary operators
+                    Token::Bang => {
+                        self.expression_operator_stack.push((Token::Bang, 255));
+                    }
+                    Token::Plus => {
+                        // Can be ignored
+                    }
+                    Token::Minus => {
+                        // push a "0-..." onto the stack, to turn unary minus into binary
+                        self.expression_stack.push(EngineObject::Int(0));
+                        self.expression_operator_stack.push((Token::Minus, 255));
+                    }
+                    token => {
+                        return Err(InterpreterError::InvalidExpression(token));
                     }
                 }
-                Token::Dot => {
-                    match left {
-                        EngineObject::Module(module) => {
-                            // We need to resolve the module and look up the member.
-                            let module = module.borrow_mut();
-                            let member_name = match self.tokenizer.advance() {
-                                Token::Identifier(id) => id,
-                                token => {
-                                    return Err(InterpreterError::UnexpectedToken {
-                                        expected: Token::Identifier(&[]),
-                                        found: token,
-                                    });
-                                }
-                            };
-                            // TODO: parse function arguments as expressions
+            } else {
+                // Expecting operators
+                let op = self.tokenizer.peek();
+                match op {
+                    Token::Equals
+                    | Token::Lt
+                    | Token::Gt
+                    | Token::Lte
+                    | Token::Gte
+                    | Token::Plus
+                    | Token::Minus
+                    | Token::Star
+                    | Token::Slash => {
+                        let (lbp, rbp) = self.infix_binding_power(&op).unwrap();
+                        while initial_ops_stack_len < self.expression_operator_stack.len()
+                            && let Some((_, top_bp)) = self.expression_operator_stack.last()
+                        {
+                            if *top_bp >= lbp {
+                                self.pop_and_apply()?;
+                            } else {
+                                break;
+                            }
                         }
-                        _ => {
-                            return Err(InterpreterError::InvalidExpression(Token::Dot));
-                        }
-                    }
 
-                    unimplemented!("member access not implemented yet");
+                        let _ = self.consume_token(&op)?;
+                        self.expression_operator_stack.push((op, rbp));
+
+                        expect_operand = true;
+                    }
+                    Token::Dot => {
+                        let lbp = 100;
+
+                        while initial_ops_stack_len < self.expression_operator_stack.len()
+                            && let Some((_, top_bp)) = self.expression_operator_stack.last()
+                        {
+                            if *top_bp >= lbp {
+                                self.pop_and_apply()?;
+                            } else {
+                                break;
+                            }
+                        }
+                        self.consume_token(&Token::Dot)?;
+                        self.expression_operator_stack.push((Token::Dot, lbp));
+                        match self.tokenizer.advance() {
+                            Token::Identifier(id) => {
+                                // We push the name as a StringLiteral so `pop_and_apply` can use it
+                                self.expression_stack
+                                    .push(EngineObject::MemberAccess { name: id });
+                            }
+                            t => {
+                                return Err(InterpreterError::UnexpectedToken {
+                                    expected: Token::Identifier(&[]),
+                                    found: t,
+                                });
+                            }
+                        }
+                        expect_operand = false;
+                    }
+                    Token::RParen => {
+                        // Execute everything back to the LParen
+                        while initial_ops_stack_len < self.expression_operator_stack.len()
+                            && let Some((top_op, _)) = self.expression_operator_stack.last()
+                        {
+                            if *top_op == Token::LParen {
+                                break;
+                            }
+                            self.pop_and_apply()?;
+                        }
+
+                        if self.expression_operator_stack.pop().map(|(t, _)| t)
+                            != Some(Token::LParen)
+                        {
+                            return Err(InterpreterError::InvalidExpression(Token::RParen));
+                        }
+                        self.consume_token(&Token::RParen)?;
+                        expect_operand = false;
+                    }
+                    _ => break,
                 }
-                Token::LParen => {
-                    unimplemented!("function calls not implemented yet");
-                }
-                _ => break left,
             }
-        })
+        }
+
+        while initial_ops_stack_len < self.expression_operator_stack.len() {
+            self.pop_and_apply()?;
+        }
+
+        self.expression_stack
+            .pop()
+            .ok_or(InterpreterError::InvalidExpression(Token::Eof))
+    }
+
+    fn pop_and_apply(&mut self) -> Result<(), InterpreterError<'a>> {
+        let (op, _) = self.expression_operator_stack.pop().unwrap();
+        let right = self
+            .expression_stack
+            .pop()
+            .ok_or(InterpreterError::InvalidExpression(Token::Eof))?;
+
+        match op {
+            // Unary operators
+            Token::Bang => {
+                if let EngineObject::Bool(b) = right {
+                    self.expression_stack.push(EngineObject::Bool(!b));
+                    return Ok(());
+                } else if let EngineObject::Int(i) = right {
+                    self.expression_stack
+                        .push(EngineObject::Int(if i == 0 { 1 } else { 0 }));
+                    return Ok(());
+                } else {
+                    return Err(InterpreterError::InvalidUnaryOperation { op, obj: right });
+                }
+            }
+            // Note that minus is handled as 0 - right, so no need to handle it here
+            // Also note that plus is allowed, but ignored as unary operator
+            _ => {} // Non-unary operators are handled in the main loop
+        }
+
+        let mut left = self
+            .expression_stack
+            .pop()
+            .ok_or(InterpreterError::InvalidExpression(Token::Eof))?;
+
+        match (&mut left, op, &right) {
+            (EngineObject::Int(l), Token::Plus, EngineObject::Int(r)) => *l += r,
+            (EngineObject::Int(l), Token::Minus, EngineObject::Int(r)) => *l -= r,
+            (EngineObject::Int(l), Token::Star, EngineObject::Int(r)) => *l *= r,
+            (EngineObject::Int(l), Token::Slash, EngineObject::Int(r)) => *l /= r,
+
+            // Handle Dot Access
+            (EngineObject::Module(m), Token::Dot, EngineObject::MemberAccess { name }) => {
+                // Your member access logic here...
+                // e.g. *left = m.borrow().get_member(content)?;
+                // TODO: something like m.borrow_mut().call(name, args), but need to resolve args
+                unimplemented!(
+                    "Resolve member {} on module",
+                    core::str::from_utf8(name).unwrap()
+                );
+            }
+
+            // Error
+            _ => {
+                return Err(InterpreterError::InvalidOperation {
+                    op,
+                    left: left.clone(),
+                    right: right.clone(),
+                });
+            }
+        }
+
+        self.expression_stack.push(left);
+        Ok(())
     }
 
     fn infix_binding_power(&self, token: &Token) -> Option<(u8, u8)> {
@@ -380,42 +525,63 @@ mod tests {
     #[test]
     fn test_simple_expr() {
         let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 * 3");
-        assert_eq!(vm.eval_expr(0).unwrap(), 7.into());
+        assert_eq!(vm.eval_expr().unwrap(), 7.into());
     }
 
     #[test]
     fn test_simple_expr2() {
         let mut vm: VmContext<'_> = VmContext::new(b"2 * 3 + 1");
-        assert_eq!(vm.eval_expr(0).unwrap(), 7.into());
+        assert_eq!(vm.eval_expr().unwrap(), 7.into());
     }
 
     #[test]
     fn long_expression() {
         let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 + 3 * 8 + 4 + 5");
-        assert_eq!(vm.eval_expr(0).unwrap(), 36.into());
+        assert_eq!(vm.eval_expr().unwrap(), 36.into());
     }
 
     #[test]
+    fn simple_parens_expression() {
+        let mut vm: VmContext<'_> = VmContext::new(b"(1 + 2 + 3)");
+        assert_eq!(vm.eval_expr().unwrap(), 6.into());
+    }
+    #[test]
     fn parens_expression() {
         let mut vm: VmContext<'_> = VmContext::new(b"(1 + 2 + 3) * (8 + 4 + 5)");
-        assert_eq!(vm.eval_expr(0).unwrap(), 102.into());
+        assert_eq!(vm.eval_expr().unwrap(), 102.into());
     }
 
     #[test]
     fn parens_nested() {
         let mut vm: VmContext<'_> = VmContext::new(b"((1 + 2) * (3 + 4)) * 5");
-        assert_eq!(vm.eval_expr(0).unwrap(), 105.into());
+        assert_eq!(vm.eval_expr().unwrap(), 105.into());
     }
 
     #[test]
     fn parens_nested2() {
         let mut vm: VmContext<'_> = VmContext::new(b"(1 * (2 * (3 * 4))) * 5");
-        assert_eq!(vm.eval_expr(0).unwrap(), 120.into());
+        assert_eq!(vm.eval_expr().unwrap(), 120.into());
     }
 
     #[test]
     fn parens_nested3() {
         let mut vm: VmContext<'_> = VmContext::new(b"5 * (4 * (3 * (2 * 1)))");
-        assert_eq!(vm.eval_expr(0).unwrap(), 120.into());
+        assert_eq!(vm.eval_expr().unwrap(), 120.into());
+    }
+
+    #[test]
+    fn unary_operators() {
+        let mut vm: VmContext<'_> = VmContext::new(b"-5");
+        assert_eq!(vm.eval_expr().unwrap(), (-5).into());
+    }
+    #[test]
+    fn unary_operators2() {
+        let mut vm: VmContext<'_> = VmContext::new(b"!5");
+        assert_eq!(vm.eval_expr().unwrap(), 0.into());
+    }
+    #[test]
+    fn unary_operators3() {
+        let mut vm: VmContext<'_> = VmContext::new(b"!0");
+        assert_eq!(vm.eval_expr().unwrap(), 1.into());
     }
 }

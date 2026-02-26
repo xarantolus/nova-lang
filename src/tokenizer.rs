@@ -25,13 +25,14 @@ pub enum Token<'a> {
     Gte,    // >=
 
     Plus,
-    Minus,
+    Minus, // unary or binary
     Star,
     Slash,
+    Bang, // unary not
 
     // Data
     Identifier(&'a [u8]),
-    IntegerLit(u32),
+    IntegerLit(i32),
 
     // Note: string content is still escaped, as that would require allocation
     StringLit {
@@ -141,6 +142,7 @@ impl<'a> Tokenizer<'a> {
                     return (Token::Separator, cursor, Some(Token::Separator));
                 }
 
+                b'!' => return (Token::Bang, cursor, Some(Token::Bang)),
                 b'.' => return (Token::Dot, cursor, Some(Token::Dot)),
                 b'+' => return (Token::Plus, cursor, Some(Token::Plus)),
                 b'-' => return (Token::Minus, cursor, Some(Token::Minus)),
@@ -205,10 +207,10 @@ impl<'a> Tokenizer<'a> {
 
                 // --- Numbers (Integers) ---
                 b'0'..=b'9' => {
-                    let mut value = (c - b'0') as u32;
+                    let mut value = (c - b'0') as i32;
                     while cursor < input.len() && input[cursor].is_ascii_digit() {
                         let digit = input[cursor] - b'0';
-                        value = value * 10 + digit as u32;
+                        value = value * 10 + digit as i32;
                         cursor += 1;
                     }
                     return (
@@ -335,6 +337,19 @@ mod tests {
                 Token::IntegerLit(1),
                 Token::RParen,
                 Token::Separator,
+            ],
+        );
+    }
+
+    #[test]
+    fn simple_unary() {
+        assert_tokenized(
+            "a = !5",
+            vec![
+                Token::Identifier(b"a"),
+                Token::Assign,
+                Token::Bang,
+                Token::IntegerLit(5),
             ],
         );
     }
