@@ -26,12 +26,12 @@ pub enum Token<'a> {
 
     Plus,
     Minus,
-    Multiply,
-    Divide,
+    Star,
+    Slash,
 
     // Data
     Identifier(&'a [u8]),
-    Integer(u32),
+    IntegerLit(u32),
 
     // Note: string content is still escaped, as that would require allocation
     StringLit {
@@ -144,8 +144,8 @@ impl<'a> Tokenizer<'a> {
                 b'.' => return (Token::Dot, cursor, Some(Token::Dot)),
                 b'+' => return (Token::Plus, cursor, Some(Token::Plus)),
                 b'-' => return (Token::Minus, cursor, Some(Token::Minus)),
-                b'*' => return (Token::Multiply, cursor, Some(Token::Multiply)),
-                b'/' => return (Token::Divide, cursor, Some(Token::Divide)),
+                b'*' => return (Token::Star, cursor, Some(Token::Star)),
+                b'/' => return (Token::Slash, cursor, Some(Token::Slash)),
 
                 b'=' => {
                     if cursor < input.len() && input[cursor] == b'=' {
@@ -211,7 +211,11 @@ impl<'a> Tokenizer<'a> {
                         value = value * 10 + digit as u32;
                         cursor += 1;
                     }
-                    return (Token::Integer(value), cursor, Some(Token::Integer(value)));
+                    return (
+                        Token::IntegerLit(value),
+                        cursor,
+                        Some(Token::IntegerLit(value)),
+                    );
                 }
 
                 // --- Identifiers & Keywords ---
@@ -277,19 +281,19 @@ mod tests {
             vec![
                 Token::Identifier(b"a"),
                 Token::Assign,
-                Token::Integer(5),
+                Token::IntegerLit(5),
                 Token::Plus,
-                Token::Integer(3),
+                Token::IntegerLit(3),
                 Token::Separator,
                 Token::Identifier(b"b"),
                 Token::Assign,
                 Token::Identifier(b"a"),
                 Token::Plus,
-                Token::Integer(5),
+                Token::IntegerLit(5),
                 Token::Separator,
                 Token::Identifier(b"print"),
                 Token::LParen,
-                Token::Integer(5),
+                Token::IntegerLit(5),
                 Token::RParen,
                 Token::Separator,
             ],
@@ -309,18 +313,18 @@ mod tests {
             vec![
                 Token::Identifier(b"a"),
                 Token::Assign,
-                Token::Integer(5),
+                Token::IntegerLit(5),
                 Token::Separator,
                 Token::While,
                 Token::Identifier(b"a"),
                 Token::Lt,
-                Token::Integer(10),
+                Token::IntegerLit(10),
                 Token::LBrace,
                 Token::Identifier(b"a"),
                 Token::Assign,
                 Token::Identifier(b"a"),
                 Token::Plus,
-                Token::Integer(1),
+                Token::IntegerLit(1),
                 Token::Separator,
                 Token::RBrace,
                 Token::Separator,
@@ -328,7 +332,7 @@ mod tests {
                 Token::LParen,
                 Token::Identifier(b"a"),
                 Token::Plus,
-                Token::Integer(1),
+                Token::IntegerLit(1),
                 Token::RParen,
                 Token::Separator,
             ],
