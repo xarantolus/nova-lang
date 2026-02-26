@@ -1,7 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 
-use core::any::Any;
 use core::cell::RefCell;
+
+#[cfg(any(debug_assertions, test))]
 use core::fmt::Debug;
 
 use arrayvec::ArrayVec;
@@ -50,6 +51,7 @@ pub enum EngineObject<'a> {
 impl PartialEq for EngineObject<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (EngineObject::Bool(a), EngineObject::Bool(b)) => a == b,
             (EngineObject::Int(a), EngineObject::Int(b)) => a == b,
             (
                 EngineObject::StringLiteral { content: a, .. },
@@ -60,6 +62,7 @@ impl PartialEq for EngineObject<'_> {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 impl core::fmt::Display for EngineObject<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -85,6 +88,7 @@ impl core::fmt::Display for EngineObject<'_> {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 impl core::fmt::Debug for EngineObject<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         <Self as core::fmt::Display>::fmt(self, f)
@@ -97,16 +101,22 @@ impl<'a> Into<EngineObject<'a>> for i32 {
     }
 }
 
-impl Into<i32> for EngineObject<'_> {
-    fn into(self) -> i32 {
+impl<'a> TryInto<i32> for EngineObject<'a> {
+    type Error = InterpreterError<'a>;
+
+    fn try_into(self) -> Result<i32, Self::Error> {
         match self {
-            EngineObject::Int(i) => i,
-            _ => panic!("Expected Int"),
+            EngineObject::Int(i) => Ok(i),
+            _ => Err(InterpreterError::InvalidConversion {
+                from: self,
+                to: "i32",
+            }),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(PartialEq, Clone)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
     NameError(&'a [u8]),
     InvalidUnaryOperation {
@@ -117,6 +127,10 @@ pub enum InterpreterError<'a> {
         op: Token<'a>,
         left: EngineObject<'a>,
         right: EngineObject<'a>,
+    },
+    InvalidConversion {
+        from: EngineObject<'a>,
+        to: &'static str,
     },
     InvalidExpression(Token<'a>),
     UnexpectedToken {
@@ -173,6 +187,12 @@ pub struct VmContext<
 impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DEPTH: usize>
     VmContext<'a, STACK_SIZE, MAX_CALL_DEPTH, MAX_LOOP_DEPTH>
 {
+    const _ASSERT_STACK_SIZE: () = assert!(STACK_SIZE > 0, "STACK_SIZE must be greater than 0");
+    const _ASSERT_MAX_CALL_DEPTH: () =
+        assert!(MAX_CALL_DEPTH > 0, "MAX_CALL_DEPTH must be greater than 0");
+    const _ASSERT_MAX_LOOP_DEPTH: () =
+        assert!(MAX_LOOP_DEPTH > 0, "MAX_LOOP_DEPTH must be greater than 0");
+
     pub fn new(script: &'a [u8]) -> Self {
         Self::new_with_modules(script, None)
     }
@@ -189,7 +209,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             module_resolver,
         };
         // global context starts with 0 objects
-        vm.current_function_objects.push(0);
+        unsafe {
+            // SAFETY: works since MAX_CALL_DEPTH > 0, asserted above
+            vm.current_function_objects.push_unchecked(0);
+        }
         vm
     }
 
@@ -256,7 +279,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             }
         }
 
-        self.stack.push(Variable { name, value });
+        unsafe {
+            // SAFETY: checked at function start
+            self.stack.push_unchecked(Variable { name, value });
+        };
         self.current_function_objects[self.frame_pointers.len()] += 1;
         Ok(())
     }
@@ -320,21 +346,29 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                     }
                     Token::LParen => {
                         // Push sentinel with 0 precedence so nothing pops it until RParen
-                        self.expression_operator_stack.push((Token::LParen, 0));
+                        self.expression_operator_stack
+                            .try_push((Token::LParen, 0))
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
 
                         // we don't change expect_operand here!
                     }
                     // Unary operators
                     Token::Bang => {
-                        self.expression_operator_stack.push((Token::Bang, 255));
+                        self.expression_operator_stack
+                            .try_push((Token::Bang, 255)) // highest precedence for unary ops
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
                     }
                     Token::Plus => {
                         // Can be ignored
                     }
                     Token::Minus => {
                         // push a "0-..." onto the stack, to turn unary minus into binary
-                        self.expression_stack.push(EngineObject::Int(0));
-                        self.expression_operator_stack.push((Token::Minus, 255));
+                        self.expression_stack
+                            .try_push(EngineObject::Int(0))
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
+                        self.expression_operator_stack
+                            .try_push((Token::Minus, 255)) // highest precedence for unary ops
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
                     }
                     token => {
                         return Err(InterpreterError::InvalidExpression(token));
@@ -365,7 +399,9 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                         }
 
                         let _ = self.consume_token(&op)?;
-                        self.expression_operator_stack.push((op, rbp));
+                        self.expression_operator_stack
+                            .try_push((op, rbp))
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
 
                         expect_operand = true;
                     }
@@ -382,12 +418,15 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
                             }
                         }
                         self.consume_token(&Token::Dot)?;
-                        self.expression_operator_stack.push((Token::Dot, lbp));
+                        self.expression_operator_stack
+                            .try_push((Token::Dot, lbp))
+                            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
                         match self.tokenizer.advance() {
                             Token::Identifier(id) => {
                                 // We push the name as a StringLiteral so `pop_and_apply` can use it
                                 self.expression_stack
-                                    .push(EngineObject::MemberAccess { name: id });
+                                    .try_push(EngineObject::MemberAccess { name: id })
+                                    .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
                             }
                             t => {
                                 return Err(InterpreterError::UnexpectedToken {
@@ -442,11 +481,14 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             // Unary operators
             Token::Bang => {
                 if let EngineObject::Bool(b) = right {
-                    self.expression_stack.push(EngineObject::Bool(!b));
+                    self.expression_stack
+                        .try_push(EngineObject::Bool(!b))
+                        .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
                     return Ok(());
                 } else if let EngineObject::Int(i) = right {
                     self.expression_stack
-                        .push(EngineObject::Int(if i == 0 { 1 } else { 0 }));
+                        .try_push(EngineObject::Int(if i == 0 { 1 } else { 0 }))
+                        .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
                     return Ok(());
                 } else {
                     return Err(InterpreterError::InvalidUnaryOperation { op, obj: right });
@@ -489,7 +531,9 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
             }
         }
 
-        self.expression_stack.push(left);
+        self.expression_stack
+            .try_push(left)
+            .map_err(|_| InterpreterError::ExpressionStackExhausted)?;
         Ok(())
     }
 
