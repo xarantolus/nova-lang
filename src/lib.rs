@@ -24,8 +24,10 @@ pub type ModuleResolver<'a> = fn(&'a [u8]) -> Option<&'a mut dyn Module<'a>>;
 #[derive(Clone)]
 pub enum EngineObject<'a> {
     Module(&'a RefCell<dyn Module<'a>>),
-    // Position of the function in the script. We can jump to it to call it.
-    Function(u32),
+    Function {
+        // Position of the function in the script, at the opening brace of arguments. We can jump to it to call it.
+        position: usize,
+    },
     // A simple integer value.
     Int(i32),
     Bool(bool),
@@ -75,7 +77,7 @@ impl core::fmt::Display for EngineObject<'_> {
                 )
             }
             EngineObject::Module(_) => write!(f, "<module>"),
-            EngineObject::Function(pos) => write!(f, "<function@{}>", pos),
+            EngineObject::Function { position } => write!(f, "<function@{}>", position),
             EngineObject::Handle { id, .. } => write!(f, "<handle@{}>", id),
             EngineObject::Unit => write!(f, "void"),
             EngineObject::MemberAccess { name } => write!(
@@ -217,17 +219,57 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
     }
 
     pub fn run(&mut self) -> Result<(), InterpreterError<'a>> {
-        while self.step().is_ok() {}
+        while let Ok(true) = self.step() {}
         Ok(())
     }
 
     // Returns: Ok(true) if work was done, Ok(false) if EOF, Err on error
     pub fn step(&mut self) -> Result<bool, InterpreterError<'a>> {
-        // 1. Peek at the next token to decide the statement type
-        let token = self.tokenizer.peek();
+        let (first_token, second_token) = self.tokenizer.peek2();
 
-        // match token {}
-        unimplemented!()
+        match (first_token, second_token) {
+            (Token::Identifier(var_name), Token::Assign) => {
+                // Skip both
+                self.tokenizer.advance();
+                self.tokenizer.advance();
+
+                let value = self.eval_expr()?;
+                self.consume_separator()?;
+
+                self.set_var(var_name, value)?;
+            }
+            (Token::Fn, Token::Identifier(function_name)) => {
+                unimplemented!("function definitions")
+            }
+            (Token::If, _) => {
+                // After if comes an expression
+                unimplemented!("if statements")
+            }
+            (Token::Return, _) => {
+                // Empty, separator, or expression
+                unimplemented!("return statements")
+            }
+            (Token::While, _) => {
+                // while + condition
+                unimplemented!("while")
+            }
+            (Token::LParen, _) => {
+                // Expressions
+                unimplemented!("expressions")
+            }
+            (Token::LBrace, _) => {
+                // Blocks
+                unimplemented!("blocks")
+            }
+            (Token::Eof, _) => return Ok(false),
+            // Anything else is just an expression, e.g. a function call
+            _ => {
+                // Expression
+                unimplemented!("catch all")
+            }
+        }
+
+        Ok(true)
     }
 
     /// Consumes next tokens, ensuring it is the expected one, otherwise returns an error.
@@ -244,14 +286,20 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
     }
 
     /// Consumes separator tokens (optional!)
-    fn consume_separator(&mut self) {
+    fn consume_separator(&mut self) -> Result<(), InterpreterError<'a>> {
         // We allow multiple semicolons as statement separators, but they are optional, so we just skip them if they are there.
-        while self.tokenizer.peek() == Token::Separator {
-            self.tokenizer.advance();
+        let token = self.tokenizer.advance();
+        if Token::Separator == token || Token::Eof == token {
+            return Ok(());
+        } else {
+            return Err(InterpreterError::UnexpectedToken {
+                expected: Token::Separator,
+                found: token,
+            });
         }
     }
 
-    fn set_var(
+    pub fn set_var(
         &mut self,
         name: &'a [u8],
         value: EngineObject<'a>,
@@ -287,8 +335,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_LOOP_DE
         Ok(())
     }
 
-    // TODO: maybe return error
-    fn get_var(&mut self, name: &'a [u8]) -> Result<&mut EngineObject<'a>, InterpreterError<'a>> {
+    pub fn get_var(
+        &mut self,
+        name: &'a [u8],
+    ) -> Result<&mut EngineObject<'a>, InterpreterError<'a>> {
         // We look for the variable in the current function stack first, then global context if not found.
         let locals_count = self.current_function_objects[self.frame_pointers.len()];
         let locals_range = ((self.stack.len() - locals_count)..self.stack.len()).rev();
@@ -627,5 +677,12 @@ mod tests {
     fn unary_operators3() {
         let mut vm: VmContext<'_> = VmContext::new(b"!0");
         assert_eq!(vm.eval_expr().unwrap(), 1.into());
+    }
+
+    #[test]
+    fn assign_variables() {
+        let mut vm: VmContext<'_> = VmContext::new(b"a = 5 + 5;");
+        assert!(vm.run().is_ok());
+        assert_eq!(*vm.get_var(b"a").unwrap(), 10.into());
     }
 }

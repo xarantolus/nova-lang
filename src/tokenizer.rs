@@ -87,6 +87,13 @@ impl<'a> Tokenizer<'a> {
         tok
     }
 
+    pub fn peek2(&self) -> (Token<'a>, Token<'a>) {
+        let (tok1, cursor, lt) = Self::next_token_inner(self.input, self.cursor, self.last_token);
+        let (tok2, _, _) = Self::next_token_inner(self.input, cursor, lt);
+
+        return (tok1, tok2);
+    }
+
     /// The actual tokenization logic, stateless.
     fn next_token_inner(
         input: &'a [u8],
