@@ -48,13 +48,16 @@ pub struct Tokenizer<'a> {
 }
 
 impl<'a> Tokenizer<'a> {
-    pub fn new(input: &'a [u8]) -> Self {
+    pub const fn new(input: &'a [u8]) -> Self {
         Self {
             input,
             cursor: 0,
             last_token: None,
         }
     }
+
+    // TODO: maybe implement a reset(&'a [u8]) function to reuse the same tokenizer for multiple scripts
+    // Would allow allocating a single engine once containing it
 
     pub fn set_cursor(&mut self, pos: usize) {
         self.cursor = pos;
@@ -66,7 +69,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Returns the next token and advances the tokenizer state.
-    pub fn next_token(&mut self) -> Token<'a> {
+    pub fn advance(&mut self) -> Token<'a> {
         let (tok, cursor, last_token) =
             Self::next_token_inner(self.input, self.cursor, self.last_token);
         self.cursor = cursor;
@@ -230,7 +233,7 @@ mod tests {
     fn tokenize_all<'a>(tok: &'a mut Tokenizer) -> Vec<Token<'a>> {
         let mut tokens = Vec::new();
         loop {
-            let next = tok.next_token();
+            let next = tok.advance();
             if next == Token::Eof {
                 break;
             }
