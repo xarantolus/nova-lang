@@ -126,7 +126,14 @@ impl<'a> Tokenizer<'a> {
                 b'(' => return (Token::OpenParen, cursor, Some(Token::OpenParen)),
                 b')' => return (Token::CloseParen, cursor, Some(Token::CloseParen)),
                 b'{' => return (Token::OpenBrace, cursor, Some(Token::OpenBrace)),
-                b'}' => return (Token::CloseBrace, cursor, Some(Token::CloseBrace)),
+                b'}' => {
+                    if last_token != Some(Token::Separator) && last_token != Some(Token::OpenBrace)
+                    {
+                        // Emit a separator before the close brace if the last token was not already a separator or an open brace
+                        return (Token::Separator, start, Some(Token::Separator));
+                    }
+                    return (Token::CloseBrace, cursor, Some(Token::CloseBrace));
+                }
                 b',' => return (Token::Comma, cursor, Some(Token::Comma)),
 
                 b';' | b'\n' => {
@@ -238,7 +245,7 @@ impl<'a> Tokenizer<'a> {
                     let token = match text {
                         b"fn" => Token::Fn,
                         b"if" => Token::If,
-                        b"ret" => Token::Return,
+                        b"return" => Token::Return,
                         b"else" => Token::Else,
                         b"while" => Token::While,
                         _ => Token::Identifier(text),
