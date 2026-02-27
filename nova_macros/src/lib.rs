@@ -1,8 +1,34 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-// Note: Using DeriveInput instead of ItemStruct
-use syn::{Data, DeriveInput, Fields, FnArg, ImplItem, ItemImpl, parse_macro_input};
+use syn::{Fields, FnArg, ImplItem, ItemImpl, ItemStruct, parse_macro_input};
 
+/// Annotation for impl blocks. It generates a ModuleCall implementation
+/// that dispatches calls to the annotated methods based on their names and argument counts.
+///
+/// Example usage:
+/// ```rust
+/// use nova_macros::{engine_module, script_module};
+///
+/// #[engine_module]
+/// struct MathModule;
+///
+/// #[script_module]
+/// impl MathModule {
+///     pub fn add(&self, a: i32, b: i32) -> i32 {
+///         a + b
+///     }
+/// }
+///
+/// fn example() {
+///     let mut math = MathModule {};
+///     let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.add(1, 2);")
+///         .add_module(b"math", &mut math)
+///         .unwrap();
+///     vm.run().unwrap();
+///
+///     let result = vm.get_var(b"i").unwrap(); // 3
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream {
     let input_impl = parse_macro_input!(input as ItemImpl);
@@ -74,28 +100,35 @@ pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream 
     })
 }
 
-#[proc_macro_derive(EngineModule)]
-pub fn derive_module_get(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
+/// Annotation for structs. It generates a ModuleGet implementation
+/// that allows accessing the annotated fields as module members.
+///
+/// See [macro@script_module] for example usage.
+#[proc_macro_attribute]
+pub fn engine_module(_args: TokenStream, input: TokenStream) -> TokenStream {
+    // Parse as ItemStruct instead of DeriveInput to handle the full struct definition
+    let item_struct = parse_macro_input!(input as ItemStruct);
+    let name = &item_struct.ident;
 
     let mut get_arms = Vec::new();
 
-    if let Data::Struct(data_struct) = &input.data {
-        if let Fields::Named(fields) = &data_struct.fields {
-            for field in &fields.named {
-                let field_name = field.ident.as_ref().unwrap();
-                let field_str = field_name.to_string();
-                let field_bytes = syn::LitByteStr::new(field_str.as_bytes(), field_name.span());
+    // ItemStruct has fields directly, no need to match on Data::Struct
+    if let Fields::Named(fields) = &item_struct.fields {
+        for field in &fields.named {
+            let field_name = field.ident.as_ref().unwrap();
+            let field_str = field_name.to_string();
+            let field_bytes = syn::LitByteStr::new(field_str.as_bytes(), field_name.span());
 
-                get_arms.push(quote! {
-                    #field_bytes => ToEngine::to_engine(self.#field_name),
-                });
-            }
+            get_arms.push(quote! {
+                #field_bytes => ToEngine::to_engine(self.#field_name),
+            });
         }
     }
 
     TokenStream::from(quote! {
+        #[allow(non_snake_case)]
+        #item_struct
+
         impl ModuleGet for #name {
             fn internal_get<'a>(
                 &self,

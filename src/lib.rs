@@ -7,6 +7,8 @@ use arrayvec::ArrayVec;
 
 use crate::tokenizer::{Token, Tokenizer};
 
+pub use nova_macros::{engine_module, script_module};
+
 mod tokenizer;
 
 /// Trait for implementing function calls on modules.
@@ -72,6 +74,8 @@ pub trait ToEngine<'a> {
     fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>>;
 }
 
+/// Different types of objects that can be manipulated in the engine.
+/// This is the main "value" type of the engine, used for variables, function arguments, return values, etc.
 #[derive(Clone)]
 pub enum EngineObject<'a> {
     Module(usize),
@@ -240,6 +244,7 @@ impl<'a> TryInto<bool> for EngineObject<'a> {
     }
 }
 
+/// Errors that can occur during interpretation.
 #[derive(PartialEq, Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
@@ -1647,9 +1652,9 @@ mod tests {
         assert!(matches!(vm.run(), Err(InterpreterError::BreakOutsideLoop)));
     }
 
-    use nova_macros::{EngineModule, script_module};
+    use nova_macros::{engine_module, script_module};
 
-    #[derive(EngineModule)]
+    #[engine_module]
     struct MathModule {}
 
     #[script_module]
@@ -1669,7 +1674,7 @@ mod tests {
         assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
     }
 
-    #[derive(EngineModule)]
+    #[engine_module]
     struct FancyMathModule {
         MAX_INT: i32,
     }
