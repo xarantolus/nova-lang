@@ -67,6 +67,7 @@ impl PartialEq for EngineObject<'_> {
         match (self, other) {
             (EngineObject::Bool(a), EngineObject::Bool(b)) => a == b,
             (EngineObject::Int(a), EngineObject::Int(b)) => a == b,
+            (EngineObject::Unit, EngineObject::Unit) => true,
             (
                 EngineObject::StringLiteral { content: a, .. },
                 EngineObject::StringLiteral { content: b, .. },
@@ -209,10 +210,9 @@ pub enum InterpreterError<'a> {
 enum BlockScope {
     Normal,
     While {
-        // position is the position of the while expression
-        position: usize,
-        // position after the end brace, if known
-        end_position: Option<usize>,
+        /// Cursor position immediately after the `while` keyword,
+        /// where the condition expression begins.
+        condition_start: usize,
     },
     If,
     Else,
@@ -231,11 +231,11 @@ pub struct VmContext<
     'a,
     const STACK_SIZE: usize = 32,
     const MAX_CALL_DEPTH: usize = 16,
-    const MAX_SCOPE_DEPTH: usize = 8,
+    const MAX_SCOPE_DEPTH: usize = 32,
     const MAX_EXPRESSION_DEPTH: usize = 16,
 > {
     // locals[0..current_function_objects[0]] == global context.
-    stack: ArrayVec<Variable<'a>, STACK_SIZE>,
+    variables: ArrayVec<Variable<'a>, STACK_SIZE>,
 
     // We keep track of block/loop/function frames.
     scope_stack: ArrayVec<BlockScope, MAX_SCOPE_DEPTH>,
@@ -268,7 +268,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
 
     pub fn new_with_modules(script: &'a [u8], module_resolver: Option<ModuleResolver<'a>>) -> Self {
         let mut vm = Self {
-            stack: ArrayVec::new_const(),
+            variables: ArrayVec::new_const(),
             scope_stack: ArrayVec::new_const(),
             current_block_scope: ArrayVec::new_const(),
             tokenizer: Tokenizer::new(script),
@@ -363,7 +363,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
 
                 self.consume_token(&Token::OpenBrace)?;
 
-                self.skip_block()?;
+                self.skip_block(None)?;
 
                 self.consume_separator()?;
 
@@ -391,7 +391,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         .map_err(|_| InterpreterError::ScopeStackExhausted)?;
                 } else {
                     // Skip block, expect else
-                    self.skip_block()?;
+                    self.skip_block(None)?;
                     self.consume_token(&Token::Else)?;
                     self.consume_token(&Token::OpenBrace)?;
                     self.scope_stack
@@ -437,7 +437,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                     }
                 };
 
-                self.stack.truncate(self.stack.len() - vars_to_remove);
+                self.variables
+                    .truncate(self.variables.len() - vars_to_remove);
 
                 self.expression_stack
                     .try_push(result_expression)
@@ -446,41 +447,90 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                 self.tokenizer.set_cursor(return_address);
             }
             (Token::While, _) => {
-                // while + condition
-                unimplemented!("while")
+                self.tokenizer.advance(); // consume 'while'
+                let condition_start = self.tokenizer.cursor_pos(); // before condition
+
+                let expression_res = self.eval_expr()?.is_true()?;
+                self.consume_token(&Token::OpenBrace)?;
+                // cursor is now at body_start
+
+                if expression_res {
+                    self.scope_stack
+                        .try_push(BlockScope::While { condition_start })
+                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    self.current_block_scope
+                        .try_push(0)
+                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    // cursor stays at body_start
+                } else {
+                    self.skip_block(None)?;
+                    // cursor is now after '}'
+                }
             }
             (Token::OpenBrace, _) => {}
             (Token::CloseBrace, _) => {
-                // Blocks
+                // End of a block scope ({}, function without return, if, loop)
 
                 // Consume the brace
                 self.tokenizer.advance();
 
-                // pop one off the scope stack?
                 let Some(block) = self.scope_stack.pop() else {
                     return Err(InterpreterError::ScopeStackEmpty);
                 };
-                // TODO: if we pop a function block, we have a function end without return?
-                // Either return unit or error
 
-                // The count for the block we just popped
+                // How many variables were created in the block we just popped
                 let var_count = self
                     .current_block_scope
                     .pop()
                     .ok_or(InterpreterError::ScopeStackEmpty)?;
 
-                let next = self.tokenizer.peek();
-                if block == BlockScope::If && next == Token::Else {
-                    // We executed the if, so we skip the else block
-                    self.tokenizer.advance();
-                    self.consume_token(&Token::OpenBrace)?;
-                    self.skip_block()?;
+                self.variables.truncate(self.variables.len() - var_count);
+
+                match block {
+                    BlockScope::Function { return_addr } => {
+                        // function ends without return statement -> return unit
+                        self.expression_stack
+                            .try_push(EngineObject::Unit)
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                        self.tokenizer.set_cursor(return_addr);
+                        // Do NOT consume_separator here — the call site handles its own separator.
+                    }
+                    BlockScope::If => {
+                        // If ended, skip over else block if present
+                        let next = self.tokenizer.peek();
+                        if next == Token::Else {
+                            self.tokenizer.advance();
+                            self.consume_token(&Token::OpenBrace)?;
+                            self.skip_block(None)?;
+                        }
+                        self.consume_separator()?;
+                    }
+                    BlockScope::While { condition_start } => {
+                        let body_end = self.tokenizer.cursor_pos(); // right after '}'
+
+                        // Re-evaluate the condition
+                        self.tokenizer.set_cursor(condition_start);
+                        let continue_loop = self.eval_expr()?.is_true()?;
+                        self.consume_token(&Token::OpenBrace)?;
+                        // cursor is now at body_start
+
+                        if continue_loop {
+                            self.scope_stack
+                                .try_push(BlockScope::While { condition_start })
+                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                            self.current_block_scope
+                                .try_push(0)
+                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                            // cursor stays at body_start
+                        } else {
+                            self.tokenizer.set_cursor(body_end);
+                            self.consume_separator()?;
+                        }
+                    }
+                    _ => {
+                        self.consume_separator()?;
+                    }
                 }
-
-                // Delete scope-specific variables
-                self.stack.truncate(self.stack.len() - var_count);
-
-                self.consume_separator()?;
             }
             (Token::Separator, Token::Eof) | (Token::Eof, _) => return Ok(false),
             // Anything else is just an expression, e.g. a function call
@@ -524,7 +574,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         name: &'a [u8],
         value: EngineObject<'a>,
     ) -> Result<(), InterpreterError<'a>> {
-        if self.stack.len() >= STACK_SIZE {
+        if self.variables.len() >= STACK_SIZE {
             return Err(InterpreterError::ObjectStackOverflow);
         }
 
@@ -546,7 +596,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             }
         }
 
-        let stack_len = self.stack.len();
+        let stack_len = self.variables.len();
         let locals_range = (stack_len - locals_count..stack_len).rev();
 
         // 2. Determine global range.
@@ -559,10 +609,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             (0..0).rev()
         };
 
-        // 3. Perform the search and update (Borrow Checker Safe: we are iterating indices, not references to self)
+        // 3. Perform the search and update
         for i in locals_range.chain(globals_range) {
-            if self.stack[i].name == name {
-                self.stack[i].value = value;
+            if self.variables[i].name == name {
+                self.variables[i].value = value;
                 return Ok(());
             }
         }
@@ -570,7 +620,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         // 4. Not found: Insert new variable into current scope
         unsafe {
             // SAFETY: checked at function start
-            self.stack.push_unchecked(Variable { name, value });
+            self.variables.push_unchecked(Variable { name, value });
         };
 
         // Update the count for the current specific block (top of the scope stack)
@@ -585,7 +635,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         &mut self,
         name: &'a [u8],
     ) -> Result<&mut EngineObject<'a>, InterpreterError<'a>> {
-        let mut current_stack_index = self.stack.len();
+        let mut current_stack_index = self.variables.len();
 
         // Look in current function stack first
         for (scope, &count) in self
@@ -599,8 +649,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             current_stack_index = start;
 
             for i in (start..end).rev() {
-                if self.stack[i].name == name {
-                    return Ok(&mut self.stack[i].value);
+                if self.variables[i].name == name {
+                    return Ok(&mut self.variables[i].value);
                 }
             }
 
@@ -612,8 +662,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         // Fallback to global context
         if let Some(&global_count) = self.current_block_scope.first() {
             for i in (0..global_count).rev() {
-                if self.stack[i].name == name {
-                    return Ok(&mut self.stack[i].value);
+                if self.variables[i].name == name {
+                    return Ok(&mut self.variables[i].value);
                 }
             }
         }
@@ -751,103 +801,136 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         expect_operand = false;
                     }
                     Token::OpenParen => {
-                        // We land here on function calls
-                        // TODO: figure out module function calls with dot operator
-                        self.tokenizer.advance();
+                        // Pop function object BEFORE evaluating args.
+                        // At this point expression_stack top is the Function (just pushed when
+                        // the identifier was resolved). We must pop it now so args don't bury it.
+                        let func = match self.expression_stack.pop() {
+                            Some(f @ EngineObject::Function { .. }) => f,
+                            Some(other) => {
+                                return Err(InterpreterError::ExpectedCallable { got: other });
+                            }
+                            None => {
+                                return Err(InterpreterError::ExpectedCallable {
+                                    got: EngineObject::Unit,
+                                });
+                            }
+                        };
 
-                        // First evaluate expressions passed to function
-                        // They are pushed onto the stack, and will need to be bound in reverse order
+                        self.tokenizer.advance(); // consume '('
+
+                        // Record where args start so we can index them correctly even if
+                        // the outer expression already has values on expression_stack.
+                        let args_start = self.expression_stack.len();
                         let mut nargs = 0;
                         let mut is_first = true;
                         loop {
-                            let next_token = self.tokenizer.peek();
-                            if next_token == Token::CloseParen {
+                            if self.tokenizer.peek() == Token::CloseParen {
                                 self.tokenizer.advance();
                                 break;
                             }
-
                             if !is_first {
                                 self.consume_token(&Token::Comma)?;
                             }
-
-                            let expr_res = self.eval_expr()?;
+                            let val = self.eval_expr()?;
                             self.expression_stack
-                                .try_push(expr_res)
+                                .try_push(val)
                                 .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                             nargs += 1;
                             is_first = false;
                         }
 
-                        match self.expression_stack.pop() {
-                            Some(EngineObject::Function {
-                                position,
-                                num_args,
+                        let EngineObject::Function {
+                            position,
+                            num_args,
+                            name,
+                        } = func
+                        else {
+                            unreachable!("function was checked to be a Function just above")
+                        };
+
+                        if num_args != nargs {
+                            return Err(InterpreterError::FunctionArgsMismatch {
+                                expected: num_args,
+                                got: nargs,
                                 name,
-                            }) => {
-                                if num_args != nargs {
-                                    return Err(InterpreterError::FunctionArgsMismatch {
-                                        expected: num_args,
-                                        got: nargs,
-                                        name,
+                            });
+                        }
+
+                        // return_addr is the position after the closing ')' of the call site.
+                        let return_addr = self.tokenizer.cursor_pos();
+                        self.scope_stack
+                            .try_push(BlockScope::Function { return_addr })
+                            .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                        self.current_block_scope
+                            .try_push(0)
+                            .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+
+                        // Jump tokenizer to function definition: position is right after '(' in "fn name("
+                        // so the cursor is at the first argument name (e.g., 'a' in "fn add(a, b)").
+                        self.tokenizer.set_cursor(position);
+
+                        // Bind each parameter by reading its name from the definition and
+                        // pairing it with the corresponding evaluated argument.
+                        for i in 0..num_args {
+                            let arg_name = match self.tokenizer.advance() {
+                                Token::Identifier(n) => n,
+                                t => {
+                                    return Err(InterpreterError::UnexpectedToken {
+                                        expected: Token::Identifier(&[]),
+                                        found: t,
                                     });
                                 }
+                            };
+                            let value = self.expression_stack[args_start + i].clone();
+                            self.set_var(arg_name, value)?;
+                            if i < num_args - 1 {
+                                self.consume_token(&Token::Comma)?;
+                            }
+                        }
 
-                                // push instruction pointer
-                                let current_pos = self.tokenizer.cursor_pos();
-                                self.scope_stack
-                                    .try_push(BlockScope::Function {
-                                        return_addr: current_pos,
-                                    })
-                                    .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                                self.current_block_scope
-                                    .try_push(num_args)
-                                    .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                        // Clean up args from expression_stack now that they are bound as variables.
+                        self.expression_stack.truncate(args_start);
 
-                                // jump to function
-                                self.tokenizer.set_cursor(position);
-                                // We should now be directly after the opening parentheses of the arguments
-                                // so we are after "fn foo("
-                                for i in 0..num_args {
-                                    //get name of argument from function definition, then bind values
-                                    let arg_token = self.tokenizer.advance();
-                                    let arg_name = match arg_token {
-                                        Token::Identifier(name) => name,
-                                        t => {
-                                            return Err(InterpreterError::UnexpectedToken {
-                                                expected: Token::Identifier(&[]),
-                                                found: t,
-                                            });
-                                        }
-                                    };
-                                    let value = self.expression_stack
-                                        [self.expression_stack.len() - num_args + i]
-                                        .clone();
-                                    self.set_var(arg_name, value)?;
-                                    if i < num_args - 1 {
-                                        self.consume_token(&Token::Comma)?;
+                        // Consume ')' and '{' from the function *definition*.
+                        self.consume_token(&Token::CloseParen)?;
+                        self.consume_token(&Token::OpenBrace)?;
+
+                        // Execute the function body by driving step() until the Function scope
+                        // is popped. The scope was just pushed, so fn_scope_depth == current depth.
+                        // The return handler (explicit return) and the CloseBrace handler (implicit
+                        // Unit return) both pop the Function scope and push the result onto
+                        // expression_stack before jumping back to return_addr.
+                        let fn_scope_depth = self.scope_stack.len();
+                        loop {
+                            match self.step() {
+                                Ok(true) => {
+                                    if self.scope_stack.len() < fn_scope_depth {
+                                        break; // function scope was popped by return or '}'
                                     }
                                 }
-                                // Remove args from stack
-                                self.expression_stack
-                                    .truncate(self.expression_stack.len() - num_args);
+                                Ok(false) => break, // EOF
+                                Err(e) => return Err(e),
+                            }
+                        }
 
-                                self.consume_token(&Token::CloseParen)?;
-                                self.consume_token(&Token::OpenBrace)?;
-                            }
-                            // TODO: figure out module function calls?
-                            _ => {
-                                return Err(InterpreterError::ExpectedCallable {
-                                    got: self
-                                        .expression_stack
-                                        .last()
-                                        .unwrap_or(&EngineObject::Unit)
-                                        .clone(),
-                                });
-                            }
-                        };
-                        expect_operand = true;
+                        // The function result is now on expression_stack (placed by return or CloseBrace).
+                        // Signal that we have an operand so the outer expression can continue (e.g., + 1).
+                        expect_operand = false;
                     }
                     Token::CloseParen => {
+                        // Only handle this ')' if there is a matching '(' on *our* local op stack.
+                        // If there isn't one, this ')' belongs to an outer context (e.g., a
+                        // function call's argument list) — just stop evaluating and let the
+                        // caller handle it.
+                        let has_matching_paren = self.expression_operator_stack
+                            [initial_ops_stack_len..]
+                            .iter()
+                            .any(|(t, _)| *t == Token::OpenParen);
+
+                        if !has_matching_paren {
+                            break;
+                        }
+
                         // Execute everything back to the OpenParen
                         while initial_ops_stack_len < self.expression_operator_stack.len()
                             && let Some((top_op, _)) = self.expression_operator_stack.last()
@@ -858,11 +941,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                             self.pop_and_apply()?;
                         }
 
-                        if self.expression_operator_stack.pop().map(|(t, _)| t)
-                            != Some(Token::OpenParen)
-                        {
-                            return Err(InterpreterError::InvalidExpression(Token::CloseParen));
-                        }
+                        self.expression_operator_stack.pop(); // pop the OpenParen sentinel
                         self.consume_token(&Token::CloseParen)?;
                         expect_operand = false;
                     }
@@ -890,19 +969,23 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         match op {
             // Unary operators
             Token::Bang => {
-                if let EngineObject::Bool(b) = right {
-                    self.expression_stack
-                        .try_push(EngineObject::Bool(!b))
-                        .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-                    return Ok(());
-                } else if let EngineObject::Int(i) = right {
-                    self.expression_stack
-                        .try_push(EngineObject::Int(if i == 0 { 1 } else { 0 }))
-                        .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-                    return Ok(());
-                } else {
-                    return Err(InterpreterError::InvalidUnaryOperation { op, obj: right });
-                }
+                match right {
+                    EngineObject::Bool(b) => {
+                        self.expression_stack
+                            .try_push(EngineObject::Bool(!b))
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                        return Ok(());
+                    }
+                    EngineObject::Int(i) => {
+                        self.expression_stack
+                            .try_push(EngineObject::Int(if i == 0 { 1 } else { 0 }))
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                        return Ok(());
+                    }
+                    _ => {
+                        return Err(InterpreterError::InvalidUnaryOperation { op, obj: right });
+                    }
+                };
             }
             // Note that minus is handled as 0 - right, so no need to handle it here
             // Also note that plus is allowed, but ignored as unary operator
@@ -979,8 +1062,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         }
     }
 
-    fn skip_block(&mut self) -> Result<(), InterpreterError<'a>> {
-        let mut depth = 1; // We assume we just passed the opening '{' (or are about to)
+    fn skip_block(&mut self, initial: Option<usize>) -> Result<(), InterpreterError<'a>> {
+        let mut depth = initial.unwrap_or(1); // We assume we just passed the opening '{' (or are about to)
 
         while depth > 0 {
             match self.tokenizer.advance() {
@@ -1180,5 +1263,87 @@ mod tests {
         );
         vm.run().expect("Running VM with function call");
         assert_eq!(*vm.get_var(b"c").unwrap(), 5.into());
+    }
+
+    #[test]
+    fn stack_overflow() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br#"fn recurse() { return recurse(); }
+                recurse();
+            "#,
+        );
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::ScopeStackExhausted)
+        ));
+    }
+
+    #[test]
+    fn fibonacci() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br#"fn fib(n) {
+                if n <= 1 {
+                    return n;
+                } else {
+                    return fib(n - 1) + fib(n - 2);
+                }
+            }
+            result = fib(10);
+            "#,
+        );
+        vm.run().expect("Running VM with Fibonacci function");
+        assert_eq!(*vm.get_var(b"result").unwrap(), 55.into());
+    }
+
+    #[test]
+    fn function_call_two_args() {
+        let mut vm: VmContext<'_> =
+            VmContext::new(b"fn add(a, b) { return a + b; }\nresult = add(2, 3);");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"result").unwrap(), 5.into());
+    }
+
+    #[test]
+    fn function_call_implicit_unit() {
+        let mut vm: VmContext<'_> = VmContext::new(b"fn noop() {}\nresult = noop();");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"result").unwrap(), EngineObject::Unit);
+    }
+
+    #[test]
+    fn function_call_in_expression() {
+        let mut vm: VmContext<'_> =
+            VmContext::new(b"fn add(a, b) { return a + b; }\nresult = add(2, 3) + 1;");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"result").unwrap(), 6.into());
+    }
+
+    #[test]
+    fn nested_function_call_as_arg() {
+        let mut vm: VmContext<'_> = VmContext::new(b"fn double(x) { return x * 2; }\nfn add(a, b) { return a + b; }\nresult = add(double(2), 3);");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"result").unwrap(), 7.into());
+    }
+
+    #[test]
+    fn while_loop_basic() {
+        let mut vm: VmContext<'_> = VmContext::new(b"i = 0;\nwhile i < 3 {\ni = i + 1;\n}");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"i").unwrap(), 3.into());
+    }
+
+    #[test]
+    fn while_loop_never_executes() {
+        let mut vm: VmContext<'_> = VmContext::new(b"i = 5;\nwhile i < 3 {\ni = i + 1;\n}");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"i").unwrap(), 5.into());
+    }
+
+    #[test]
+    fn while_loop_accumulates() {
+        let mut vm: VmContext<'_> =
+            VmContext::new(b"i = 0;\nsum = 0;\nwhile i < 5 {\nsum = sum + i;\ni = i + 1;\n}");
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 10.into());
     }
 }

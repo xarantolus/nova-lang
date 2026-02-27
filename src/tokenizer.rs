@@ -6,6 +6,8 @@ pub enum Token<'a> {
     Else,
     Return,
     While,
+    Continue,
+    Break,
     OpenParen,
     CloseParen,
     OpenBrace,
@@ -33,6 +35,7 @@ pub enum Token<'a> {
     // Data
     Identifier(&'a [u8]),
     IntegerLit(i32),
+    BooleanLit(bool),
 
     // Note: string content is still escaped, as that would require allocation
     StringLit {
@@ -248,6 +251,10 @@ impl<'a> Tokenizer<'a> {
                         b"return" => Token::Return,
                         b"else" => Token::Else,
                         b"while" => Token::While,
+                        b"continue" => Token::Continue,
+                        b"break" => Token::Break,
+                        b"true" => Token::BooleanLit(true),
+                        b"false" => Token::BooleanLit(false),
                         _ => Token::Identifier(text),
                     };
                     return (token, cursor, Some(token));
