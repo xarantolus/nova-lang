@@ -6,18 +6,17 @@ use core::fmt::Debug;
 use arrayvec::ArrayVec;
 
 use crate::tokenizer::{Token, Tokenizer};
-pub use nova_macros::{EngineModule, script_module};
 
 mod tokenizer;
 
 pub trait ModuleCall {
     fn internal_call<'a>(
         &mut self,
-        _func: &'a [u8],
+        func: &'a [u8],
         args: &[EngineObject<'a>],
     ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
         Err(InterpreterError::InvalidModuleFunctionCall {
-            func: _func,
+            func,
             nargs: args.len(),
         })
     }
@@ -29,22 +28,38 @@ pub trait ModuleGet {
     }
 }
 
-// The core trait
-pub trait Module: ModuleCall + ModuleGet {
+pub trait Module {
+    fn call<'a>(
+        &mut self,
+        func: &'a [u8],
+        args: &[EngineObject<'a>],
+    ) -> Result<EngineObject<'a>, InterpreterError<'a>>;
+
+    fn get<'a>(&self, member: &'a [u8]) -> Result<EngineObject<'a>, InterpreterError<'a>>;
+}
+
+impl<T> Module for T
+where
+    T: ModuleCall + ModuleGet,
+{
     fn call<'a>(
         &mut self,
         func: &'a [u8],
         args: &[EngineObject<'a>],
     ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-        self.internal_call(func, args)
+        ModuleCall::internal_call(self, func, args)
     }
 
     fn get<'a>(&self, member: &'a [u8]) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-        self.internal_get(member)
+        ModuleGet::internal_get(self, member)
     }
 }
 
-impl<T: ModuleCall + ModuleGet> Module for T {}
+// // If you implement ModuleCall, you automatically get ModuleGet (default).
+// impl<T: ModuleCall> ModuleGet for T {}
+
+// // If you implement ModuleGet, you automatically get ModuleCall (default).
+// impl<T: ModuleGet> ModuleCall for T {}
 
 pub trait FromEngine<'a>: Sized {
     fn from_engine(obj: &EngineObject<'a>) -> Result<Self, InterpreterError<'a>>;
@@ -1620,8 +1635,11 @@ mod tests {
         assert!(matches!(vm.run(), Err(InterpreterError::BreakOutsideLoop)));
     }
 
+    use nova_macros::{EngineModule, script_module};
+
     #[derive(EngineModule)]
     struct MathModule {}
+
     #[script_module]
     impl MathModule {
         pub fn add(&self, a: i32, b: i32) -> i32 {
@@ -1639,10 +1657,16 @@ mod tests {
         assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
     }
 
-    use nova_macros::{EngineModule, script_module};
     #[derive(EngineModule)]
     struct FancyMathModule {
         MAX_INT: i32,
+    }
+
+    #[script_module]
+    impl FancyMathModule {
+        fn set_max(&mut self, max: i32) {
+            self.MAX_INT = max;
+        }
     }
 
     #[test]
@@ -1654,12 +1678,5 @@ mod tests {
                 .unwrap();
         vm.run().unwrap();
         assert_eq!(*vm.get_var(b"i").unwrap(), 100.to_engine().unwrap());
-    }
-
-    #[script_module]
-    impl FancyMathModule {
-        fn set_max(&mut self, max: i32) {
-            self.MAX_INT = max;
-        }
     }
 }

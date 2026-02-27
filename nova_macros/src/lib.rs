@@ -4,10 +4,9 @@ use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, FnArg, ImplItem, ItemImpl, parse_macro_input};
 
 #[proc_macro_attribute]
-pub fn module_functions(_metadata: TokenStream, input: TokenStream) -> TokenStream {
-    // Parse the input from proc_macro::TokenStream
+pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream {
     let input_impl = parse_macro_input!(input as ItemImpl);
-    let struct_name = &input_impl.self_ty;
+    let struct_ty = &input_impl.self_ty;
 
     let mut call_arms = Vec::new();
 
@@ -31,11 +30,12 @@ pub fn module_functions(_metadata: TokenStream, input: TokenStream) -> TokenStre
                 .collect();
 
             let nargs = inputs.len();
+
             let arg_conversions = inputs.iter().enumerate().map(|(i, pt)| {
                 let ty = &pt.ty;
-                let idx_name = format_ident!("arg_{}", i);
+                let idx = format_ident!("arg_{}", i);
                 quote! {
-                    let #idx_name = <#ty as FromEngine>::from_engine(&args[#i])?;
+                    let #idx = <#ty as FromEngine>::from_engine(&args[#i])?;
                 }
             });
 
@@ -44,18 +44,17 @@ pub fn module_functions(_metadata: TokenStream, input: TokenStream) -> TokenStre
             call_arms.push(quote! {
                 (#method_bytes, #nargs) => {
                     #(#arg_conversions)*
-                    let result = #struct_name::#method_name(self, #(#call_args),*);
+                    let result = self.#method_name(#(#call_args),*);
                     ToEngine::to_engine(result)
                 }
             });
         }
     }
 
-    // Convert the quote! (proc_macro2) back to proc_macro::TokenStream
     TokenStream::from(quote! {
         #input_impl
 
-        impl ModuleCall for #struct_name {
+        impl ModuleCall for #struct_ty {
             fn internal_call<'a>(
                 &mut self,
                 func: &'a [u8],
@@ -63,7 +62,12 @@ pub fn module_functions(_metadata: TokenStream, input: TokenStream) -> TokenStre
             ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
                 match (func, args.len()) {
                     #(#call_arms)*
-                    _ => Err(InterpreterError::InvalidModuleFunctionCall { func, nargs: args.len() }),
+                    _ => Err(
+                        InterpreterError::InvalidModuleFunctionCall {
+                            func,
+                            nargs: args.len(),
+                        }
+                    ),
                 }
             }
         }
@@ -77,7 +81,6 @@ pub fn derive_module_get(input: TokenStream) -> TokenStream {
 
     let mut get_arms = Vec::new();
 
-    // DeriveInput uses .data instead of .fields
     if let Data::Struct(data_struct) = &input.data {
         if let Fields::Named(fields) = &data_struct.fields {
             for field in &fields.named {
@@ -94,7 +97,10 @@ pub fn derive_module_get(input: TokenStream) -> TokenStream {
 
     TokenStream::from(quote! {
         impl ModuleGet for #name {
-            fn internal_get<'a>(&self, member: &'a [u8]) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+            fn internal_get<'a>(
+                &self,
+                member: &'a [u8],
+            ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
                 match member {
                     #(#get_arms)*
                     _ => Err(InterpreterError::InvalidModuleMemberAccess { member }),
