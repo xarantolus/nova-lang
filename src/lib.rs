@@ -9,6 +9,8 @@ use crate::tokenizer::{Token, Tokenizer};
 
 mod tokenizer;
 
+/// Trait for implementing function calls on modules.
+/// This is separate from `Module` to allow modules that only have member access (e.g. constants) without needing to implement a full call interface.
 pub trait ModuleCall {
     fn internal_call<'a>(
         &mut self,
@@ -22,12 +24,15 @@ pub trait ModuleCall {
     }
 }
 
+/// Trait for implementing member access on modules.
+/// This is separate from `Module` to allow modules that only have functions without needing to implement a full member access interface.
 pub trait ModuleGet {
     fn internal_get<'a>(&self, member: &'a [u8]) -> Result<EngineObject<'a>, InterpreterError<'a>> {
         Err(InterpreterError::InvalidModuleMemberAccess { member })
     }
 }
 
+/// A module represents a library that can be imported and used in scripts, providing bindings to native functionality.
 pub trait Module {
     fn call<'a>(
         &mut self,
@@ -55,17 +60,14 @@ where
     }
 }
 
-// // If you implement ModuleCall, you automatically get ModuleGet (default).
-// impl<T: ModuleCall> ModuleGet for T {}
-
-// // If you implement ModuleGet, you automatically get ModuleCall (default).
-// impl<T: ModuleGet> ModuleCall for T {}
-
+/// Trait for converting from engine objects to Rust types.
+/// This is used for module function implementations to convert arguments.
 pub trait FromEngine<'a>: Sized {
     fn from_engine(obj: &EngineObject<'a>) -> Result<Self, InterpreterError<'a>>;
 }
 
-// Unidirectional: Rust -> Engine
+/// Trait for converting from Rust types to engine objects.
+/// This is used for module function implementations to convert return values to types that can be used in the script.
 pub trait ToEngine<'a> {
     fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>>;
 }
@@ -100,7 +102,7 @@ pub enum EngineObject<'a> {
     // Modules should allocate their own memory and return handles representing objects.
     Handle {
         id: u32,
-        module: u8,
+        module: usize,
     },
     Unit,
 }
@@ -241,61 +243,67 @@ impl<'a> TryInto<bool> for EngineObject<'a> {
 #[derive(PartialEq, Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
+    /// The name provided was not found in the current variable context.
     InvalidName(&'a [u8]),
+    /// A module import failed because the module name was not found in the registered modules.
     ModuleNotResolved(&'a [u8]),
-    InvalidExpressionResult {
-        obj: EngineObject<'a>,
-    },
-    InvalidModuleFunctionCall {
-        func: &'a [u8],
-        nargs: usize,
-    },
-    InvalidModuleMemberAccess {
-        member: &'a [u8],
-    },
-    InvalidModuleFunctionArguments {
-        func: &'a [u8],
-        expected: &'static str,
-    },
-    InvalidFunctionCall {
-        obj: EngineObject<'a>,
-    },
+    /// An expression resulted in a value that cannot be used, e.g. trying to use a string literal as a condition.
+    InvalidExpressionResult { obj: EngineObject<'a> },
+    /// A nonexistent function call was done on a module, or with the wrong number of arguments.
+    InvalidModuleFunctionCall { func: &'a [u8], nargs: usize },
+    /// A nonexistent member was accessed on a module.
+    InvalidModuleMemberAccess { member: &'a [u8] },
+    /// Function call on a non-function object.
+    InvalidFunctionCall { obj: EngineObject<'a> },
+    /// Unary operation on a type that does not support it, e.g. negation on a string.
     InvalidUnaryOperation {
         op: Token<'a>,
         obj: EngineObject<'a>,
     },
-    InvalidOperation {
+    /// Attempt to perform a binary operation on incompatible types.
+    InvalidBinaryOperation {
         op: Token<'a>,
         left: EngineObject<'a>,
         right: EngineObject<'a>,
     },
+    /// Attempt to convert an engine object to a Rust type that it cannot be converted to.
+    /// Typically used in [FromEngine::from_engine].
     InvalidTypeConversion {
         from: EngineObject<'a>,
         to: &'static str,
     },
-    InvalidExpression(Token<'a>),
+    /// Invalid Token encountered while expecting an operand, e.g. after "5 +"
+    InvalidOperandToken(Token<'a>),
     UnexpectedToken {
         expected: Token<'a>,
         found: Token<'a>,
     },
-    ExpectedCallable {
-        got: EngineObject<'a>,
-    },
+    /// Attempt to call a function defined with a specific number of arguments with the wrong number of arguments.
+    /// e.g. "fn test(a,b) {}; test();"
     FunctionArgsMismatch {
         expected: usize,
         got: usize,
         name: Option<&'a [u8]>,
     },
-    ScopeVariableMismatch,
+    /// Continue statement encountered outside of a loop.
     ContinueOutsideLoop,
+    /// Break statement encountered outside of a loop.
     BreakOutsideLoop,
+    /// Attempt to pop a scope when there are no scopes left.
     ScopeStackEmpty,
+    /// Attempt to push a new scope when the scope stack is already at maximum capacity.
     ScopeStackExhausted,
+    /// Attempt to pop an expression when there are no expression results left.
     ExpressionStackEmpty,
+    /// Attempt to push a new expression when the expression stack is already at maximum capacity.
     ExpressionStackOverflow,
-    TooManySteps,
-    ObjectStackOverflow,
+    /// Out of steps when running with a step limit.
+    TooManyOperations,
+    /// Attempt to declare a new variable when the variable stack is already at maximum capacity.
+    VariableStackOverflow,
+    /// Attempt to add more modules than specified in the generic parameter.
     TooManyModules,
+    /// End of file reached while skipping over a block
     UnexpectedEoF,
 }
 
@@ -311,26 +319,33 @@ enum BlockScope {
     If,
     Else,
     Function {
-        // We act as the frame pointer here
+        // frame pointer for this function call
         return_addr: usize,
     },
 }
 
+/// Named variable and value.
 struct Variable<'a> {
     name: &'a [u8],
     value: EngineObject<'a>,
 }
 
+/// The virtual machine context, holding all state needed for execution.
+///
+/// The generic parameters specify various limits for the VM, to allow tuning for different environments and use cases.
+/// - `STACK_SIZE`: maximum number of variables that can be in scope at once.
+/// - `MAX_SCOPE_DEPTH`: maximum depth of nested blocks (e.g. ifs, loops, functions).
+/// - `MAX_EXPRESSION_DEPTH`: maximum depth of nested expressions
+/// - `MAX_MODULES`: maximum number of modules that can be registered and imported.
 pub struct VmContext<
     'a,
     'm,
     const STACK_SIZE: usize = 32,
-    const MAX_CALL_DEPTH: usize = 16,
     const MAX_SCOPE_DEPTH: usize = 32,
     const MAX_EXPRESSION_DEPTH: usize = 16,
     const MAX_MODULES: usize = 4,
 > {
-    // locals[0..current_function_objects[0]] == global context.
+    // variables[0..current_block_scope[0]] == global context.
     variables: ArrayVec<Variable<'a>, STACK_SIZE>,
 
     // We keep track of block/loop/function frames.
@@ -343,6 +358,9 @@ pub struct VmContext<
     expression_stack: ArrayVec<EngineObject<'a>, MAX_EXPRESSION_DEPTH>,
     expression_operator_stack: ArrayVec<(Token<'a>, u8), MAX_EXPRESSION_DEPTH>,
 
+    operations_limit: usize,
+    current_operations: usize,
+
     tokenizer: Tokenizer<'a>,
     // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
 }
@@ -351,29 +369,18 @@ impl<
     'a,
     'm,
     const STACK_SIZE: usize,
-    const MAX_CALL_DEPTH: usize,
     const MAX_SCOPE_DEPTH: usize,
     const MAX_EXPRESSION_DEPTH: usize,
     const MAX_MODULES: usize,
->
-    VmContext<
-        'a,
-        'm,
-        STACK_SIZE,
-        MAX_CALL_DEPTH,
-        MAX_SCOPE_DEPTH,
-        MAX_EXPRESSION_DEPTH,
-        MAX_MODULES,
-    >
+> VmContext<'a, 'm, STACK_SIZE, MAX_SCOPE_DEPTH, MAX_EXPRESSION_DEPTH, MAX_MODULES>
 {
     const _ASSERT_STACK_SIZE: () = assert!(STACK_SIZE > 0, "STACK_SIZE must be greater than 0");
-    const _ASSERT_MAX_CALL_DEPTH: () =
-        assert!(MAX_CALL_DEPTH > 0, "MAX_CALL_DEPTH must be greater than 0");
     const _ASSERT_MAX_SCOPE_DEPTH: () = assert!(
         MAX_SCOPE_DEPTH > 0,
         "MAX_SCOPE_DEPTH must be greater than 0"
     );
 
+    /// Create a new VM context with the given script as input.
     pub fn new(script: &'a [u8]) -> Self {
         let mut vm = Self {
             variables: ArrayVec::new_const(),
@@ -383,6 +390,8 @@ impl<
             expression_operator_stack: ArrayVec::new_const(),
             expression_stack: ArrayVec::new_const(),
             modules: ArrayVec::new_const(),
+            operations_limit: usize::MAX,
+            current_operations: 0,
         };
         // global context starts with 0 objects
         unsafe {
@@ -392,6 +401,11 @@ impl<
             vm.current_block_scope.push_unchecked(0);
         }
         vm
+    }
+
+    pub fn set_operations_limit(mut self, limit: usize) -> Self {
+        self.operations_limit = limit;
+        self
     }
 
     /// Register a module under `name`, available in scripts via `import <name>`.
@@ -421,25 +435,18 @@ impl<
         Ok(())
     }
 
-    pub fn run_bounded(&mut self, max_steps: usize) -> Result<(), InterpreterError<'a>> {
-        // TODO: this doesn't work due to function calls, make limit part of interpreter -> increment in step
-        let mut i = 0;
-        loop {
-            if i > max_steps {
-                return Err(InterpreterError::TooManySteps);
-            }
-            match self.step() {
-                Err(e) => return Err(e),
-                Ok(false) => break,
-                _ => {}
-            }
-            i += 1;
+    fn check_operations_limit(&mut self) -> Result<(), InterpreterError<'a>> {
+        self.current_operations += 1;
+        if self.current_operations > self.operations_limit {
+            return Err(InterpreterError::TooManyOperations);
         }
         Ok(())
     }
 
     // Returns: Ok(true) if work was done, Ok(false) if EOF, Err on error
     pub fn step(&mut self) -> Result<bool, InterpreterError<'a>> {
+        self.check_operations_limit()?;
+
         let (first_token, second_token) = self.tokenizer.peek2();
 
         match (first_token, second_token) {
@@ -539,12 +546,7 @@ impl<
                 self.consume_token(&Token::OpenBrace)?;
 
                 if expression_res {
-                    self.scope_stack
-                        .try_push(BlockScope::If)
-                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                    self.current_block_scope
-                        .try_push(0)
-                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    self.enter_scope(BlockScope::If)?;
                 } else {
                     // Skip block, expect else or nothing
                     self.skip_block(None)?;
@@ -557,12 +559,7 @@ impl<
                     }
                     self.consume_token(&Token::Else)?;
                     self.consume_token(&Token::OpenBrace)?;
-                    self.scope_stack
-                        .try_push(BlockScope::Else)
-                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                    self.current_block_scope
-                        .try_push(0)
-                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    self.enter_scope(BlockScope::Else)?;
                 }
 
                 // Now we are in the correct block
@@ -605,7 +602,7 @@ impl<
 
                 self.expression_stack
                     .try_push(result_expression)
-                    .map_err(|_| InterpreterError::ObjectStackOverflow)?;
+                    .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
 
                 self.tokenizer.set_cursor(return_address);
             }
@@ -618,12 +615,7 @@ impl<
                 // cursor is now at body_start
 
                 if expression_res {
-                    self.scope_stack
-                        .try_push(BlockScope::While { condition_start })
-                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                    self.current_block_scope
-                        .try_push(0)
-                        .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                    self.enter_scope(BlockScope::While { condition_start })?;
                     // cursor stays at body_start
                 } else {
                     self.skip_block(None)?;
@@ -726,6 +718,16 @@ impl<
         }
     }
 
+    fn enter_scope(&mut self, scope: BlockScope) -> Result<(), InterpreterError<'a>> {
+        self.scope_stack
+            .try_push(scope)
+            .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+        self.current_block_scope
+            .try_push(0)
+            .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+        Ok(())
+    }
+
     fn evaluate_while_condition(
         &mut self,
         condition_start: usize,
@@ -737,12 +739,7 @@ impl<
         // cursor is now at body_start
 
         if continue_loop {
-            self.scope_stack
-                .try_push(BlockScope::While { condition_start })
-                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-            self.current_block_scope
-                .try_push(0)
-                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+            self.enter_scope(BlockScope::While { condition_start })?;
             // cursor stays at body_start
         } else {
             self.tokenizer.set_cursor(body_end);
@@ -765,7 +762,7 @@ impl<
         }
     }
 
-    /// Consumes separator tokens (optional!)
+    /// Consumes separator tokens
     fn consume_separator(&mut self) -> Result<(), InterpreterError<'a>> {
         let token = self.tokenizer.advance();
         if Token::Separator == token || Token::Eof == token {
@@ -778,13 +775,16 @@ impl<
         }
     }
 
+    /// Set a variable in current or global scope.
+    /// If the variable is already defined in the current scope, or the global scope (not: parent scopes!),
+    /// it is updated. Otherwise, a new variable is created in the current scope.
     pub fn set_var(
         &mut self,
         name: &'a [u8],
         value: EngineObject<'a>,
     ) -> Result<(), InterpreterError<'a>> {
         if self.variables.len() >= STACK_SIZE {
-            return Err(InterpreterError::ObjectStackOverflow);
+            return Err(InterpreterError::VariableStackOverflow);
         }
 
         // 1. Calculate the number of variables in the current function scope.
@@ -877,6 +877,7 @@ impl<
         Err(InterpreterError::InvalidName(name))
     }
 
+    /// Ensures that member accesses in modules are resolved
     fn resolve_if_member(
         &mut self,
         mut obj: EngineObject<'a>,
@@ -887,12 +888,14 @@ impl<
         Ok(obj)
     }
 
+    /// Evaluate expressions
     fn eval_expr(&mut self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
         let mut expect_operand = true;
         let initial_ops_stack_len = self.expression_operator_stack.len();
 
         // We use the VmContext expression stack to prevent actual runtime stack overflows.
         loop {
+            self.check_operations_limit()?;
             if expect_operand {
                 match self.tokenizer.advance() {
                     Token::BooleanLit(b) => {
@@ -957,7 +960,7 @@ impl<
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     }
                     token => {
-                        return Err(InterpreterError::InvalidExpression(token));
+                        return Err(InterpreterError::InvalidOperandToken(token));
                     }
                 }
             } else {
@@ -1023,10 +1026,8 @@ impl<
                         expect_operand = false;
                     }
                     Token::OpenParen => {
-                        // Collapse pending Dot operators (e.g. `a.b.c(...)`) so the callee
-                        // on the expression stack is a ModuleMember rather than a bare
-                        // MemberAccess. Only drain Dots — other operators (+ etc.) belong
-                        // to the surrounding expression and must not be touched here.
+                        // Collapse pending Dot operators (e.g. `module.function`) so the callee
+                        // on the expression stack is a ModuleMember rather than a bare MemberAccess.
                         while initial_ops_stack_len < self.expression_operator_stack.len() {
                             match self.expression_operator_stack.last() {
                                 Some((Token::Dot, _)) => self.pop_and_apply()?,
@@ -1070,12 +1071,7 @@ impl<
                                 name: _,
                             } => {
                                 // Push scope only for user-defined functions
-                                self.scope_stack
-                                    .try_push(BlockScope::Function { return_addr })
-                                    .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                                self.current_block_scope
-                                    .try_push(0)
-                                    .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                                self.enter_scope(BlockScope::Function { return_addr })?;
 
                                 if num_args != nargs_on_stack {
                                     return Err(InterpreterError::FunctionArgsMismatch {
@@ -1190,6 +1186,7 @@ impl<
         self.resolve_if_member(res)
     }
 
+    /// Pops one operator and the necessary number of operands, applies the operator, and pushes the result.
     fn pop_and_apply(&mut self) -> Result<(), InterpreterError<'a>> {
         let (op, _) = self.expression_operator_stack.pop().unwrap();
         let right = self
@@ -1266,7 +1263,7 @@ impl<
 
             // Error
             _ => {
-                return Err(InterpreterError::InvalidOperation {
+                return Err(InterpreterError::InvalidBinaryOperation {
                     op,
                     left: left.clone(),
                     right: right.clone(),
@@ -1401,7 +1398,7 @@ mod tests {
             VmContext::new(b"a = 5 + 5; b = a + 5; c = b + a;");
         assert!(matches!(
             vm.run(),
-            Err(InterpreterError::ObjectStackOverflow)
+            Err(InterpreterError::VariableStackOverflow)
         ));
     }
 
