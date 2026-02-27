@@ -870,8 +870,12 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         // Pop function object BEFORE evaluating args.
                         // At this point expression_stack top is the Function (just pushed when
                         // the identifier was resolved). We must pop it now so args don't bury it.
-                        let func = match self.expression_stack.pop() {
-                            Some(f @ EngineObject::Function { .. }) => f,
+                        let (position, num_args, name) = match self.expression_stack.pop() {
+                            Some(EngineObject::Function {
+                                position,
+                                num_args,
+                                name,
+                            }) => (position, num_args, name),
                             Some(other) => {
                                 return Err(InterpreterError::ExpectedCallable { got: other });
                             }
@@ -904,15 +908,6 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                             nargs += 1;
                             is_first = false;
                         }
-
-                        let EngineObject::Function {
-                            position,
-                            num_args,
-                            name,
-                        } = func
-                        else {
-                            unreachable!("function was checked to be a Function just above")
-                        };
 
                         if num_args != nargs {
                             return Err(InterpreterError::FunctionArgsMismatch {
