@@ -196,6 +196,8 @@ pub enum InterpreterError<'a> {
         name: Option<&'a [u8]>,
     },
     ScopeVariableMismatch,
+    ContinueOutsideLoop,
+    BreakOutsideLoop,
     ScopeStackEmpty,
     ScopeStackExhausted,
     ExpressionStackEmpty,
@@ -294,6 +296,10 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                 _ => {}
             }
         }
+        debug_assert!(
+            self.scope_stack.len() == 1,
+            "scope stack should be back to global scope at end of execution"
+        );
         Ok(())
     }
 
@@ -390,8 +396,15 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         .try_push(0)
                         .map_err(|_| InterpreterError::ScopeStackExhausted)?;
                 } else {
-                    // Skip block, expect else
+                    // Skip block, expect else or nothing
                     self.skip_block(None)?;
+
+                    // there may be an else block, or nothing
+                    let next = self.tokenizer.peek();
+                    if next != Token::Else {
+                        self.consume_separator()?;
+                        return Ok(true);
+                    }
                     self.consume_token(&Token::Else)?;
                     self.consume_token(&Token::OpenBrace)?;
                     self.scope_stack
@@ -467,6 +480,17 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                     // cursor is now after '}'
                 }
             }
+            (Token::Continue, _) => {
+                self.tokenizer.advance();
+                let (loop_condition_pos, _) = self.pop_loop(true)?;
+                self.evaluate_while_condition(loop_condition_pos)?;
+            }
+            (Token::Break, _) => {
+                self.tokenizer.advance();
+                let (_, scopes_popped) = self.pop_loop(false)?;
+                // skip remaining scopes
+                self.skip_block(Some(scopes_popped))?;
+            }
             (Token::OpenBrace, _) => {}
             (Token::CloseBrace, _) => {
                 // End of a block scope ({}, function without return, if, loop)
@@ -506,26 +530,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         self.consume_separator()?;
                     }
                     BlockScope::While { condition_start } => {
-                        let body_end = self.tokenizer.cursor_pos(); // right after '}'
-
                         // Re-evaluate the condition
-                        self.tokenizer.set_cursor(condition_start);
-                        let continue_loop = self.eval_expr()?.is_true()?;
-                        self.consume_token(&Token::OpenBrace)?;
-                        // cursor is now at body_start
-
-                        if continue_loop {
-                            self.scope_stack
-                                .try_push(BlockScope::While { condition_start })
-                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                            self.current_block_scope
-                                .try_push(0)
-                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                            // cursor stays at body_start
-                        } else {
-                            self.tokenizer.set_cursor(body_end);
-                            self.consume_separator()?;
-                        }
+                        self.evaluate_while_condition(condition_start)?;
                     }
                     _ => {
                         self.consume_separator()?;
@@ -541,6 +547,59 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         }
 
         Ok(true)
+    }
+
+    fn pop_loop(&mut self, is_continue: bool) -> Result<(usize, usize), InterpreterError<'a>> {
+        let mut vars_to_remove = 0;
+        let mut num_scopes = 0;
+
+        loop {
+            let Some(scope) = self.scope_stack.pop() else {
+                return Err(if is_continue {
+                    InterpreterError::ContinueOutsideLoop
+                } else {
+                    InterpreterError::BreakOutsideLoop
+                });
+            };
+            vars_to_remove += self
+                .current_block_scope
+                .pop()
+                .ok_or(InterpreterError::ScopeStackEmpty)?;
+            num_scopes += 1;
+
+            if let BlockScope::While { condition_start } = scope {
+                self.variables
+                    .truncate(self.variables.len() - vars_to_remove);
+
+                return Ok((condition_start, num_scopes));
+            }
+        }
+    }
+
+    fn evaluate_while_condition(
+        &mut self,
+        condition_start: usize,
+    ) -> Result<(), InterpreterError<'a>> {
+        let body_end = self.tokenizer.cursor_pos(); // right after '}'
+        self.tokenizer.set_cursor(condition_start);
+        let continue_loop = self.eval_expr()?.is_true()?;
+        self.consume_token(&Token::OpenBrace)?;
+        // cursor is now at body_start
+
+        if continue_loop {
+            self.scope_stack
+                .try_push(BlockScope::While { condition_start })
+                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+            self.current_block_scope
+                .try_push(0)
+                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+            // cursor stays at body_start
+        } else {
+            self.tokenizer.set_cursor(body_end);
+            self.consume_separator()?;
+        }
+
+        Ok(())
     }
 
     /// Consumes next tokens, ensuring it is the expected one, otherwise returns an error.
@@ -679,6 +738,13 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         loop {
             if expect_operand {
                 match self.tokenizer.advance() {
+                    Token::BooleanLit(b) => {
+                        self.expression_stack
+                            .try_push(EngineObject::Bool(b))
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+
+                        expect_operand = false;
+                    }
                     Token::IntegerLit(i) => {
                         self.expression_stack
                             .try_push(EngineObject::Int(i))
@@ -1345,5 +1411,80 @@ mod tests {
             VmContext::new(b"i = 0;\nsum = 0;\nwhile i < 5 {\nsum = sum + i;\ni = i + 1;\n}");
         vm.run().unwrap();
         assert_eq!(*vm.get_var(b"sum").unwrap(), 10.into());
+    }
+
+    #[test]
+    fn while_loop_continue() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br"
+            i = 0;
+            sum = 0;
+            while i < 4 {
+                if i == 2 {
+                    i = i + 1;
+                    continue;
+                }
+                sum = sum + i;
+                i = i + 1;
+            }",
+        );
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 4.into());
+        assert_eq!(*vm.get_var(b"i").unwrap(), 4.into());
+    }
+
+    #[test]
+    fn while_loop_break() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br"
+            i = 0;
+            sum = 0;
+            while i < 4 {
+                if i == 2 {
+                    break;
+                }
+                sum = sum + i;
+                i = i + 1;
+            }",
+        );
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 1.into());
+        assert_eq!(*vm.get_var(b"i").unwrap(), 2.into());
+    }
+
+    #[test]
+    fn while_loop_nested() {
+        let mut vm: VmContext<'_> = VmContext::new(
+            br"
+            i = 0;
+            sum = 0;
+            while i < 3 {
+                j = 0;
+                tmp = i + 1;
+                while j < 2 {
+                    new_sum = sum + i + j;
+                    sum = new_sum;
+                    j = j + 1;
+                }
+                i = tmp;
+            }",
+        );
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 9.into());
+    }
+
+    #[test]
+    fn continue_outside_loop() {
+        let mut vm: VmContext<'_> = VmContext::new(b"continue;");
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::ContinueOutsideLoop)
+        ));
+    }
+
+    #[test]
+    fn break_outside_loop() {
+        let mut vm: VmContext<'_> = VmContext::new(b"if true { break; }");
+        assert!(matches!(vm.run(), Err(InterpreterError::BreakOutsideLoop)));
     }
 }
