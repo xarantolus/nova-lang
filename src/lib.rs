@@ -877,6 +877,16 @@ impl<
         Err(InterpreterError::InvalidName(name))
     }
 
+    fn resolve_if_member(
+        &mut self,
+        mut obj: EngineObject<'a>,
+    ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        while let EngineObject::ModuleMember { module, name } = obj {
+            obj = self.modules[module].1.get(name)?;
+        }
+        Ok(obj)
+    }
+
     fn eval_expr(&mut self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
         let mut expect_operand = true;
         let initial_ops_stack_len = self.expression_operator_stack.len();
@@ -1172,9 +1182,12 @@ impl<
             self.pop_and_apply()?;
         }
 
-        self.expression_stack
+        let res = self
+            .expression_stack
             .pop()
-            .ok_or(InterpreterError::ExpressionStackEmpty)
+            .ok_or(InterpreterError::ExpressionStackEmpty)?;
+
+        self.resolve_if_member(res)
     }
 
     fn pop_and_apply(&mut self) -> Result<(), InterpreterError<'a>> {
@@ -1183,6 +1196,7 @@ impl<
             .expression_stack
             .pop()
             .ok_or(InterpreterError::ExpressionStackEmpty)?;
+        let right = self.resolve_if_member(right)?;
 
         match op {
             // Unary operators
@@ -1210,10 +1224,11 @@ impl<
             _ => {} // Non-unary operators are handled in the main loop
         }
 
-        let mut left = self
+        let left = self
             .expression_stack
             .pop()
             .ok_or(InterpreterError::ExpressionStackEmpty)?;
+        let mut left = self.resolve_if_member(left)?;
 
         match (&mut left, op, &right) {
             // Integer math
@@ -1678,5 +1693,41 @@ mod tests {
                 .unwrap();
         vm.run().unwrap();
         assert_eq!(*vm.get_var(b"i").unwrap(), 100.to_engine().unwrap());
+    }
+
+    #[test]
+    fn invalid_function_access() {
+        let mut math = MathModule {};
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.subtract(1, 2);")
+            .add_module(b"math", &mut math)
+            .unwrap();
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::InvalidModuleFunctionCall {
+                func: b"subtract",
+                nargs: 2,
+            })
+        ));
+    }
+    #[test]
+    fn invalid_member_access() {
+        let mut math = MathModule {};
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.MAX;")
+            .add_module(b"math", &mut math)
+            .unwrap();
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::InvalidModuleMemberAccess { member: b"MAX" })
+        ));
+    }
+
+    #[test]
+    fn dont_set() {
+        let mut math = FancyMathModule { MAX_INT: 100 };
+        let mut vm: VmContext<'_, '_> =
+            VmContext::new(b"import fancy_math; fancy_math.MAX_INT = 200;")
+                .add_module(b"fancy_math", &mut math)
+                .unwrap();
+        assert!(matches!(vm.run(), Err(_)));
     }
 }
