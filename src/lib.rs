@@ -246,7 +246,6 @@ impl<'a> TryInto<bool> for EngineObject<'a> {
 
 /// Errors that can occur during interpretation.
 #[derive(PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
     /// The name provided was not found in the current variable context.
     InvalidName(&'a [u8]),
@@ -263,11 +262,15 @@ pub enum InterpreterError<'a> {
     /// Unary operation on a type that does not support it, e.g. negation on a string.
     InvalidUnaryOperation {
         op: Token<'a>,
+        token_pos: usize,
+        program: &'a [u8],
         obj: EngineObject<'a>,
     },
     /// Attempt to perform a binary operation on incompatible types.
     InvalidBinaryOperation {
         op: Token<'a>,
+        token_pos: usize,
+        program: &'a [u8],
         left: EngineObject<'a>,
         right: EngineObject<'a>,
     },
@@ -278,8 +281,14 @@ pub enum InterpreterError<'a> {
         to: &'static str,
     },
     /// Invalid Token encountered while expecting an operand, e.g. after "5 +"
-    InvalidOperandToken(Token<'a>),
+    InvalidOperandToken {
+        token: Token<'a>,
+        token_pos: usize,
+        program: &'a [u8],
+    },
     UnexpectedToken {
+        token_pos: usize,
+        program: &'a [u8],
         expected: Token<'a>,
         found: Token<'a>,
     },
@@ -310,6 +319,151 @@ pub enum InterpreterError<'a> {
     TooManyModules,
     /// End of file reached while skipping over a block
     UnexpectedEoF,
+    /// An operator was applied to operands that caused an overflow, e.g. "2147483647 + 1"
+    OperatorOverflow {
+        op: Token<'a>,
+        token_pos: usize,
+        program: &'a [u8],
+    },
+    /// Division by zero error, e.g. "5 / 0"
+    DivisionByZero,
+}
+
+impl InterpreterError<'_> {
+    fn program_info(&self) -> Option<(usize, &[u8])> {
+        match self {
+            InterpreterError::InvalidUnaryOperation {
+                token_pos, program, ..
+            }
+            | InterpreterError::InvalidBinaryOperation {
+                token_pos, program, ..
+            }
+            | InterpreterError::UnexpectedToken {
+                token_pos, program, ..
+            }
+            | InterpreterError::InvalidOperandToken {
+                token_pos, program, ..
+            }
+            | InterpreterError::OperatorOverflow {
+                token_pos, program, ..
+            } => Some((*token_pos, *program)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<'a> core::fmt::Debug for InterpreterError<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            InterpreterError::InvalidName(name) => {
+                write!(
+                    f,
+                    "Invalid name: {}",
+                    core::str::from_utf8(name).unwrap_or("<invalid utf-8>")
+                )
+            }
+            InterpreterError::ModuleNotResolved(name) => {
+                write!(
+                    f,
+                    "Module not resolved: {}",
+                    core::str::from_utf8(name).unwrap_or("<invalid utf-8>")
+                )
+            }
+            InterpreterError::InvalidExpressionResult { obj } => {
+                write!(f, "Invalid expression result: {}", obj)
+            }
+            InterpreterError::InvalidModuleFunctionCall { func, nargs } => {
+                write!(
+                    f,
+                    "Invalid module function call: {} with {} args",
+                    core::str::from_utf8(func).unwrap_or("<invalid utf-8>"),
+                    nargs
+                )
+            }
+            InterpreterError::InvalidModuleMemberAccess { member } => {
+                write!(
+                    f,
+                    "Invalid module member access: {}",
+                    core::str::from_utf8(member).unwrap_or("<invalid utf-8>")
+                )
+            }
+            InterpreterError::InvalidFunctionCall { obj } => {
+                write!(f, "Invalid function call on object: {}", obj)
+            }
+            InterpreterError::InvalidUnaryOperation { op, obj, .. } => {
+                write!(f, "Invalid unary operation: {:?} on object {}", op, obj)
+            }
+            InterpreterError::InvalidBinaryOperation {
+                op, left, right, ..
+            } => {
+                write!(
+                    f,
+                    "Invalid binary operation: {:?} on objects {} and {}",
+                    op, left, right
+                )
+            }
+            InterpreterError::InvalidTypeConversion { from, to } => {
+                write!(f, "Invalid type conversion from {} to {}", from, to)
+            }
+            InterpreterError::InvalidOperandToken { token, .. } => {
+                write!(f, "Invalid operand token: {:?}", token,)
+            }
+            InterpreterError::UnexpectedToken {
+                expected, found, ..
+            } => {
+                write!(
+                    f,
+                    "Unexpected token: expected {:?}, found {:?}",
+                    expected, found
+                )
+            }
+            other => write!(f, "{:?}", other),
+        }?;
+
+        if let Some((pos, program)) = self.program_info() {
+            // Find left and right until we find newline, so we have reference to full line
+            // Calculate start of the current line (needed for column offset)
+            let current_line_start = program[..pos]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map(|r| r + 1)
+                .unwrap_or(0);
+
+            // Calculate start of the snippet (up to 2 lines before)
+            let snippet_start = program[..pos]
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|&(_, b)| *b == b'\n')
+                .nth(2) // 0=current, 1=prev, 2=prev-prev
+                .map(|(index, _)| index + 1)
+                .unwrap_or(0);
+
+            let line_end = pos
+                + program[pos..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .unwrap_or(program.len() - pos);
+
+            let line = &program[snippet_start..line_end];
+            let line_number = program[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+            let col = pos - current_line_start - 1;
+
+            write!(
+                f,
+                "\n --> at byte position {} (line {}, column {})\n{}\n{:width$}^",
+                pos,
+                line_number,
+                col + 1,
+                core::str::from_utf8(line).unwrap_or("<invalid utf-8>"),
+                "",
+                width = col
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(PartialEq)]
@@ -468,6 +622,8 @@ impl<
                         t => {
                             return Err(InterpreterError::UnexpectedToken {
                                 expected: Token::Identifier(&[]),
+                                token_pos: self.tokenizer.last_token_pos(),
+                                program: self.tokenizer.input(),
                                 found: t,
                             });
                         }
@@ -523,6 +679,8 @@ impl<
                                 } else {
                                     Token::Comma
                                 },
+                                token_pos: self.tokenizer.last_token_pos(),
+                                program: self.tokenizer.input(),
                                 found: tok,
                             });
                         }
@@ -574,6 +732,8 @@ impl<
                 return Err(InterpreterError::UnexpectedToken {
                     expected: Token::If,
                     found: Token::Else,
+                    program: self.tokenizer.input(),
+                    token_pos: self.tokenizer.last_token_pos(),
                 });
             }
             (Token::Return, rest) => {
@@ -763,6 +923,8 @@ impl<
             Err(InterpreterError::UnexpectedToken {
                 expected: *expected,
                 found: token,
+                token_pos: self.tokenizer.last_token_pos(),
+                program: self.tokenizer.input(),
             })
         }
     }
@@ -775,6 +937,8 @@ impl<
         } else {
             Err(InterpreterError::UnexpectedToken {
                 expected: Token::Separator,
+                token_pos: self.tokenizer.last_token_pos(),
+                program: self.tokenizer.input(),
                 found: token,
             })
         }
@@ -965,7 +1129,11 @@ impl<
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     }
                     token => {
-                        return Err(InterpreterError::InvalidOperandToken(token));
+                        return Err(InterpreterError::InvalidOperandToken {
+                            token,
+                            token_pos: self.tokenizer.last_token_pos(),
+                            program: self.tokenizer.input(),
+                        });
                     }
                 }
             } else {
@@ -1023,6 +1191,8 @@ impl<
                             }
                             t => {
                                 return Err(InterpreterError::UnexpectedToken {
+                                    token_pos: self.tokenizer.last_token_pos(),
+                                    program: self.tokenizer.input(),
                                     expected: Token::Identifier(&[]),
                                     found: t,
                                 });
@@ -1092,6 +1262,8 @@ impl<
                                         Token::Identifier(n) => n,
                                         t => {
                                             return Err(InterpreterError::UnexpectedToken {
+                                                token_pos: self.tokenizer.last_token_pos(),
+                                                program: self.tokenizer.input(),
                                                 expected: Token::Identifier(&[]),
                                                 found: t,
                                             });
@@ -1217,7 +1389,12 @@ impl<
                         return Ok(());
                     }
                     _ => {
-                        return Err(InterpreterError::InvalidUnaryOperation { op, obj: right });
+                        return Err(InterpreterError::InvalidUnaryOperation {
+                            op,
+                            obj: right,
+                            program: self.tokenizer.input(),
+                            token_pos: self.tokenizer.last_token_pos(),
+                        });
                     }
                 };
             }
@@ -1234,14 +1411,49 @@ impl<
 
         match (&mut left, op, &right) {
             // Integer math
-            (EngineObject::Int(l), Token::Plus, EngineObject::Int(r)) => *l += r,
-            (EngineObject::Int(l), Token::Minus, EngineObject::Int(r)) => *l -= r,
-            (EngineObject::Int(l), Token::Star, EngineObject::Int(r)) => *l *= r,
-            (EngineObject::Int(l), Token::Slash, EngineObject::Int(r)) => *l /= r,
+            (EngineObject::Int(l), Token::Plus, EngineObject::Int(r)) => {
+                *l = l
+                    .checked_add(*r)
+                    .ok_or(InterpreterError::OperatorOverflow {
+                        op,
+                        program: self.tokenizer.input(),
+                        token_pos: self.tokenizer.last_token_pos(),
+                    })?;
+            }
+            (EngineObject::Int(l), Token::Minus, EngineObject::Int(r)) => {
+                *l = l
+                    .checked_sub(*r)
+                    .ok_or(InterpreterError::OperatorOverflow {
+                        op,
+                        program: self.tokenizer.input(),
+                        token_pos: self.tokenizer.last_token_pos(),
+                    })?;
+            }
+            (EngineObject::Int(l), Token::Star, EngineObject::Int(r)) => {
+                *l = l
+                    .checked_mul(*r)
+                    .ok_or(InterpreterError::OperatorOverflow {
+                        op,
+                        program: self.tokenizer.input(),
+                        token_pos: self.tokenizer.last_token_pos(),
+                    })?;
+            }
+            (EngineObject::Int(l), Token::Slash, EngineObject::Int(r)) => {
+                if *r == 0 {
+                    return Err(InterpreterError::DivisionByZero);
+                }
+                *l = l
+                    .checked_div(*r)
+                    .ok_or(InterpreterError::OperatorOverflow {
+                        op,
+                        program: self.tokenizer.input(),
+                        token_pos: self.tokenizer.last_token_pos(),
+                    })?;
+            }
 
             // Comparison operators
             (EngineObject::Int(l), Token::Equals, EngineObject::Int(r)) => {
-                left = EngineObject::Bool(l == r)
+                left = EngineObject::Bool(*l == *r)
             }
             (EngineObject::Int(l), Token::Lt, EngineObject::Int(r)) => {
                 left = EngineObject::Bool(*l < *r)
@@ -1272,6 +1484,8 @@ impl<
                     op,
                     left: left.clone(),
                     right: right.clone(),
+                    program: self.tokenizer.input(),
+                    token_pos: self.tokenizer.last_token_pos(),
                 });
             }
         }
@@ -1731,5 +1945,132 @@ mod tests {
                 .add_module(b"fancy_math", &mut math)
                 .unwrap();
         assert!(matches!(vm.run(), Err(_)));
+    }
+
+    #[test]
+    fn fibonacci_two() {
+        let mut vm: VmContext<'_, '_> = VmContext::new(
+            br#"
+            fn fib_recursive(n) {
+                if n == 0 {
+                    return 0;
+                }
+                if n == 1 {
+                    return 1;
+                }
+                return fib_recursive(n-1) + fib_recursive(n-2);
+            };
+
+            fn fib_iterative(n) {
+                a = 0;
+                b = 1;
+                if n == 0 {
+                    return a;
+                }
+                if n == 1 {
+                    return b;
+                }
+                i = 2;
+                while i <= n {
+                    c = a + b;
+                    a = b;
+                    b = c;
+                    i = i + 1;
+                }
+                return b;
+            };
+
+            it_res = fib_iterative(10);
+            rc_res = fib_recursive(10);
+
+            same = it_res == rc_res;
+            "#,
+        );
+        vm.run().expect("Running VM with Fibonacci function");
+        assert_eq!(*vm.get_var(b"it_res").unwrap(), 55.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"rc_res").unwrap(), 55.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"same").unwrap(), true.to_engine().unwrap());
+    }
+
+    #[test]
+    fn mul_overflow() {
+        let mut vm: VmContext<'_, '_> = VmContext::new(
+            br#"
+            n = 25;
+            while true {
+                n = n * 25;
+            }
+            "#,
+        );
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::OperatorOverflow {
+                op: Token::Star,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_sibling() {
+        let mut vm: VmContext<'_, '_> = VmContext::new(
+            br#"
+            fn is_even(n) {
+                if n == 0 {
+                    return true;
+                } else {
+                    return is_odd(n - 1);
+                }
+            }
+
+            fn is_odd(n) {
+                return is_even(n - 1);
+            }
+
+            result = is_even(4);
+            "#,
+        );
+        vm.run().expect("Running VM with sibling functions");
+        assert_eq!(*vm.get_var(b"result").unwrap(), true.to_engine().unwrap());
+    }
+
+    #[test]
+    fn test_collatz() {
+        let mut vm: VmContext<'_, '_> = VmContext::new(
+            br#"
+            fn computeChainLength(n) {
+                steps = 0;
+                while n > 1 {
+                    if n == 1 {
+                        break;
+                    }
+                    if n * 2 == n {
+                        n = n / 2;
+                    } else {
+                        n = 3 * n + 1;
+                    }
+                    steps = steps + 1;
+                }
+                return steps;
+            }
+
+            i = 1;
+            max_length = 0;
+            max_number = 0;
+            while i < 1000 {
+                current_length = computeChainLength(i);
+                if current_length > max_length {
+                    max_length = current_length;
+                    max_number = i;
+                }
+                i = i + 1;
+            }
+            "#,
+        );
+        vm.run().expect("Running VM with Collatz function");
+        assert_eq!(
+            *vm.get_var(b"max_number").unwrap(),
+            871.to_engine().unwrap()
+        );
     }
 }

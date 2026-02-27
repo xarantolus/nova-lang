@@ -54,6 +54,7 @@ pub(crate) struct Tokenizer<'a> {
     input: &'a [u8],
     cursor: usize,
     last_token: Option<Token<'a>>,
+    last_token_pos: usize,
     // TODO: track comments, maybe with #
 }
 
@@ -63,7 +64,12 @@ impl<'a> Tokenizer<'a> {
             input,
             cursor: 0,
             last_token: None,
+            last_token_pos: 0,
         }
+    }
+
+    pub fn input(&self) -> &'a [u8] {
+        self.input
     }
 
     // TODO: maybe implement a reset(&'a [u8]) function to reuse the same tokenizer for multiple scripts
@@ -77,11 +83,15 @@ impl<'a> Tokenizer<'a> {
     pub fn cursor_pos(&self) -> usize {
         self.cursor
     }
+    pub fn last_token_pos(&self) -> usize {
+        self.last_token_pos
+    }
 
     /// Returns the next token and advances the tokenizer state.
     pub fn advance(&mut self) -> Token<'a> {
         let (tok, cursor, last_token) =
             Self::next_token_inner(self.input, self.cursor, self.last_token);
+        self.last_token_pos = self.cursor;
         self.cursor = cursor;
         self.last_token = last_token;
         tok
