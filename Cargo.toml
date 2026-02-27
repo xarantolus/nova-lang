@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 arrayvec = {version = "0.7.6", default-features = false	}
+nova_macros = { path = "nova_macros" }
 
 [dev-dependencies]
 similar-asserts = "1.7"

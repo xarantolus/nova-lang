@@ -1,29 +1,67 @@
 #![cfg_attr(not(test), no_std)]
 
-use core::cell::RefCell;
-
 #[cfg(any(debug_assertions, test))]
 use core::fmt::Debug;
 
 use arrayvec::ArrayVec;
 
 use crate::tokenizer::{Token, Tokenizer};
+pub use nova_macros::{EngineModule, script_module};
 
 mod tokenizer;
 
-pub trait Module<'a> {
-    fn call(
+pub trait ModuleCall {
+    fn internal_call<'a>(
+        &mut self,
+        _func: &'a [u8],
+        args: &[EngineObject<'a>],
+    ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Err(InterpreterError::InvalidModuleFunctionCall {
+            func: _func,
+            nargs: args.len(),
+        })
+    }
+}
+
+pub trait ModuleGet {
+    fn internal_get<'a>(&self, member: &'a [u8]) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Err(InterpreterError::InvalidModuleMemberAccess { member })
+    }
+}
+
+// The core trait
+pub trait Module: ModuleCall + ModuleGet {
+    fn call<'a>(
         &mut self,
         func: &'a [u8],
         args: &[EngineObject<'a>],
-    ) -> Result<EngineObject<'a>, InterpreterError<'a>>;
+    ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        self.internal_call(func, args)
+    }
+
+    fn get<'a>(&self, member: &'a [u8]) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        self.internal_get(member)
+    }
 }
 
-pub type ModuleResolver<'a> = fn(&'a [u8]) -> Option<&'a mut dyn Module<'a>>;
+impl<T: ModuleCall + ModuleGet> Module for T {}
+
+pub trait FromEngine<'a>: Sized {
+    fn from_engine(obj: &EngineObject<'a>) -> Result<Self, InterpreterError<'a>>;
+}
+
+// Unidirectional: Rust -> Engine
+pub trait ToEngine<'a> {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>>;
+}
 
 #[derive(Clone)]
 pub enum EngineObject<'a> {
-    Module(&'a RefCell<dyn Module<'a>>),
+    Module(usize),
+    ModuleMember {
+        module: usize,
+        name: &'a [u8],
+    },
     Function {
         // Position of the function in the script, at the opening brace of arguments. We can jump to it to call it.
         position: usize,
@@ -47,7 +85,7 @@ pub enum EngineObject<'a> {
     // Modules should allocate their own memory and return handles representing objects.
     Handle {
         id: u32,
-        module: &'a RefCell<dyn Module<'a>>,
+        module: u8,
     },
     Unit,
 }
@@ -90,6 +128,11 @@ impl core::fmt::Display for EngineObject<'_> {
                 )
             }
             EngineObject::Module(_) => write!(f, "<module>"),
+            EngineObject::ModuleMember { name, .. } => write!(
+                f,
+                "<module_member:{}>",
+                core::str::from_utf8(name).unwrap_or("<invalid utf-8>")
+            ),
             EngineObject::Function {
                 position,
                 num_args,
@@ -123,29 +166,46 @@ impl core::fmt::Debug for EngineObject<'_> {
     }
 }
 
-impl<'a> Into<EngineObject<'a>> for i32 {
-    fn into(self) -> EngineObject<'a> {
-        EngineObject::Int(self)
-    }
-}
-
-impl<'a> TryInto<i32> for EngineObject<'a> {
-    type Error = InterpreterError<'a>;
-
-    fn try_into(self) -> Result<i32, Self::Error> {
-        match self {
-            EngineObject::Int(i) => Ok(i),
-            _ => Err(InterpreterError::InvalidConversion {
-                from: self,
+impl<'a> FromEngine<'a> for i32 {
+    fn from_engine(obj: &EngineObject<'a>) -> Result<Self, InterpreterError<'a>> {
+        if let EngineObject::Int(i) = obj {
+            Ok(*i)
+        } else {
+            Err(InterpreterError::InvalidTypeConversion {
+                from: obj.clone(),
                 to: "i32",
-            }),
+            })
         }
     }
 }
 
-impl<'a> Into<EngineObject<'a>> for bool {
-    fn into(self) -> EngineObject<'a> {
-        EngineObject::Bool(self)
+impl<'a, T: ToEngine<'a>> ToEngine<'a> for Result<T, InterpreterError<'a>> {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        self.map_err(|e| e)?.to_engine()
+    }
+}
+
+impl<'a> ToEngine<'a> for () {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Ok(EngineObject::Unit)
+    }
+}
+
+impl<'a> ToEngine<'a> for i32 {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Ok(EngineObject::Int(self))
+    }
+}
+
+impl<'a> ToEngine<'a> for u32 {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Ok(EngineObject::Int(self as i32))
+    }
+}
+
+impl<'a> ToEngine<'a> for bool {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Ok(EngineObject::Bool(self))
     }
 }
 
@@ -155,18 +215,34 @@ impl<'a> TryInto<bool> for EngineObject<'a> {
     fn try_into(self) -> Result<bool, Self::Error> {
         match self {
             EngineObject::Bool(b) => Ok(b),
-            _ => Err(InterpreterError::InvalidConversion {
+            _ => Err(InterpreterError::InvalidTypeConversion {
                 from: self,
                 to: "bool",
             }),
         }
     }
 }
+
 #[derive(PartialEq, Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum InterpreterError<'a> {
-    NameError(&'a [u8]),
+    InvalidName(&'a [u8]),
+    ModuleNotResolved(&'a [u8]),
     InvalidExpressionResult {
+        obj: EngineObject<'a>,
+    },
+    InvalidModuleFunctionCall {
+        func: &'a [u8],
+        nargs: usize,
+    },
+    InvalidModuleMemberAccess {
+        member: &'a [u8],
+    },
+    InvalidModuleFunctionArguments {
+        func: &'a [u8],
+        expected: &'static str,
+    },
+    InvalidFunctionCall {
         obj: EngineObject<'a>,
     },
     InvalidUnaryOperation {
@@ -178,7 +254,7 @@ pub enum InterpreterError<'a> {
         left: EngineObject<'a>,
         right: EngineObject<'a>,
     },
-    InvalidConversion {
+    InvalidTypeConversion {
         from: EngineObject<'a>,
         to: &'static str,
     },
@@ -204,6 +280,7 @@ pub enum InterpreterError<'a> {
     ExpressionStackOverflow,
     TooManySteps,
     ObjectStackOverflow,
+    TooManyModules,
     UnexpectedEoF,
 }
 
@@ -231,10 +308,12 @@ struct Variable<'a> {
 
 pub struct VmContext<
     'a,
+    'm,
     const STACK_SIZE: usize = 32,
     const MAX_CALL_DEPTH: usize = 16,
     const MAX_SCOPE_DEPTH: usize = 32,
     const MAX_EXPRESSION_DEPTH: usize = 16,
+    const MAX_MODULES: usize = 4,
 > {
     // locals[0..current_function_objects[0]] == global context.
     variables: ArrayVec<Variable<'a>, STACK_SIZE>,
@@ -243,7 +322,7 @@ pub struct VmContext<
     scope_stack: ArrayVec<BlockScope, MAX_SCOPE_DEPTH>,
     current_block_scope: ArrayVec<usize, MAX_SCOPE_DEPTH>,
 
-    module_resolver: Option<ModuleResolver<'a>>,
+    modules: ArrayVec<(&'m [u8], &'m mut dyn Module), MAX_MODULES>,
 
     // Expression evaluation stacks
     expression_stack: ArrayVec<EngineObject<'a>, MAX_EXPRESSION_DEPTH>,
@@ -253,8 +332,24 @@ pub struct VmContext<
     // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
 }
 
-impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_DEPTH: usize>
-    VmContext<'a, STACK_SIZE, MAX_CALL_DEPTH, MAX_SCOPE_DEPTH>
+impl<
+    'a,
+    'm,
+    const STACK_SIZE: usize,
+    const MAX_CALL_DEPTH: usize,
+    const MAX_SCOPE_DEPTH: usize,
+    const MAX_EXPRESSION_DEPTH: usize,
+    const MAX_MODULES: usize,
+>
+    VmContext<
+        'a,
+        'm,
+        STACK_SIZE,
+        MAX_CALL_DEPTH,
+        MAX_SCOPE_DEPTH,
+        MAX_EXPRESSION_DEPTH,
+        MAX_MODULES,
+    >
 {
     const _ASSERT_STACK_SIZE: () = assert!(STACK_SIZE > 0, "STACK_SIZE must be greater than 0");
     const _ASSERT_MAX_CALL_DEPTH: () =
@@ -265,10 +360,6 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
     );
 
     pub fn new(script: &'a [u8]) -> Self {
-        Self::new_with_modules(script, None)
-    }
-
-    pub fn new_with_modules(script: &'a [u8], module_resolver: Option<ModuleResolver<'a>>) -> Self {
         let mut vm = Self {
             variables: ArrayVec::new_const(),
             scope_stack: ArrayVec::new_const(),
@@ -276,7 +367,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             tokenizer: Tokenizer::new(script),
             expression_operator_stack: ArrayVec::new_const(),
             expression_stack: ArrayVec::new_const(),
-            module_resolver,
+            modules: ArrayVec::new_const(),
         };
         // global context starts with 0 objects
         unsafe {
@@ -286,6 +377,18 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             vm.current_block_scope.push_unchecked(0);
         }
         vm
+    }
+
+    /// Register a module under `name`, available in scripts via `import <name>`.
+    pub fn add_module(
+        mut self,
+        name: &'m [u8],
+        m: &'m mut dyn Module,
+    ) -> Result<Self, InterpreterError<'a>> {
+        self.modules
+            .try_push((name, m))
+            .map_err(|_| InterpreterError::TooManyModules)?;
+        Ok(self)
     }
 
     pub fn run(&mut self) -> Result<(), InterpreterError<'a>> {
@@ -304,6 +407,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
     }
 
     pub fn run_bounded(&mut self, max_steps: usize) -> Result<(), InterpreterError<'a>> {
+        // TODO: this doesn't work due to function calls, make limit part of interpreter -> increment in step
         let mut i = 0;
         loop {
             if i > max_steps {
@@ -324,6 +428,37 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         let (first_token, second_token) = self.tokenizer.peek2();
 
         match (first_token, second_token) {
+            (Token::Import, Token::Identifier(module_import_name)) => {
+                self.tokenizer.advance();
+                self.tokenizer.advance();
+
+                // Peek forward for as, for potentially different name
+                let third_token = self.tokenizer.peek();
+                let module_var_name = if third_token == Token::As {
+                    self.tokenizer.advance(); // consume 'as'
+                    match self.tokenizer.advance() {
+                        Token::Identifier(alias) => alias,
+                        t => {
+                            return Err(InterpreterError::UnexpectedToken {
+                                expected: Token::Identifier(&[]),
+                                found: t,
+                            });
+                        }
+                    }
+                } else {
+                    module_import_name
+                };
+
+                match self
+                    .modules
+                    .iter()
+                    .position(|(n, _)| *n == module_import_name)
+                {
+                    Some(idx) => self.set_var(module_var_name, EngineObject::Module(idx))?,
+                    None => return Err(InterpreterError::ModuleNotResolved(module_import_name)),
+                }
+                self.consume_separator()?;
+            }
             (Token::Identifier(var_name), Token::Assign) => {
                 // Skip both
                 self.tokenizer.advance();
@@ -690,10 +825,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
         Ok(())
     }
 
-    pub fn get_var(
-        &mut self,
-        name: &'a [u8],
-    ) -> Result<&mut EngineObject<'a>, InterpreterError<'a>> {
+    pub fn get_var(&mut self, name: &'a [u8]) -> Result<&EngineObject<'a>, InterpreterError<'a>> {
         let mut current_stack_index = self.variables.len();
 
         // Look in current function stack first
@@ -727,7 +859,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             }
         }
 
-        Err(InterpreterError::NameError(name))
+        Err(InterpreterError::InvalidName(name))
     }
 
     fn eval_expr(&mut self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
@@ -852,7 +984,6 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                         match self.tokenizer.advance() {
                             Token::Identifier(id) => {
-                                // We push the name as a StringLiteral so `pop_and_apply` can use it
                                 self.expression_stack
                                     .try_push(EngineObject::MemberAccess { name: id })
                                     .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
@@ -867,23 +998,19 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         expect_operand = false;
                     }
                     Token::OpenParen => {
-                        // Pop function object BEFORE evaluating args.
-                        // At this point expression_stack top is the Function (just pushed when
-                        // the identifier was resolved). We must pop it now so args don't bury it.
-                        let (position, num_args, name) = match self.expression_stack.pop() {
-                            Some(EngineObject::Function {
-                                position,
-                                num_args,
-                                name,
-                            }) => (position, num_args, name),
-                            Some(other) => {
-                                return Err(InterpreterError::ExpectedCallable { got: other });
+                        // Collapse pending Dot operators (e.g. `a.b.c(...)`) so the callee
+                        // on the expression stack is a ModuleMember rather than a bare
+                        // MemberAccess. Only drain Dots — other operators (+ etc.) belong
+                        // to the surrounding expression and must not be touched here.
+                        while initial_ops_stack_len < self.expression_operator_stack.len() {
+                            match self.expression_operator_stack.last() {
+                                Some((Token::Dot, _)) => self.pop_and_apply()?,
+                                _ => break,
                             }
-                            None => {
-                                return Err(InterpreterError::ExpectedCallable {
-                                    got: EngineObject::Unit,
-                                });
-                            }
+                        }
+
+                        let Some(function_object) = self.expression_stack.pop() else {
+                            return Err(InterpreterError::ExpressionStackEmpty);
                         };
 
                         self.tokenizer.advance(); // consume '('
@@ -891,7 +1018,7 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                         // Record where args start so we can index them correctly even if
                         // the outer expression already has values on expression_stack.
                         let args_start = self.expression_stack.len();
-                        let mut nargs = 0;
+                        let mut nargs_on_stack = 0;
                         let mut is_first = true;
                         loop {
                             if self.tokenizer.peek() == Token::CloseParen {
@@ -905,72 +1032,87 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
                             self.expression_stack
                                 .try_push(val)
                                 .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-                            nargs += 1;
+                            nargs_on_stack += 1;
                             is_first = false;
                         }
 
-                        if num_args != nargs {
-                            return Err(InterpreterError::FunctionArgsMismatch {
-                                expected: num_args,
-                                got: nargs,
-                                name,
-                            });
-                        }
-
-                        // return_addr is the position after the closing ')' of the call site.
                         let return_addr = self.tokenizer.cursor_pos();
-                        self.scope_stack
-                            .try_push(BlockScope::Function { return_addr })
-                            .map_err(|_| InterpreterError::ScopeStackExhausted)?;
-                        self.current_block_scope
-                            .try_push(0)
-                            .map_err(|_| InterpreterError::ScopeStackExhausted)?;
 
-                        // Jump tokenizer to function definition: position is right after '(' in "fn name("
-                        // so the cursor is at the first argument name (e.g., 'a' in "fn add(a, b)").
-                        self.tokenizer.set_cursor(position);
+                        match function_object {
+                            EngineObject::Function {
+                                position,
+                                num_args,
+                                name: _,
+                            } => {
+                                // Push scope only for user-defined functions
+                                self.scope_stack
+                                    .try_push(BlockScope::Function { return_addr })
+                                    .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                                self.current_block_scope
+                                    .try_push(0)
+                                    .map_err(|_| InterpreterError::ScopeStackExhausted)?;
 
-                        // Bind each parameter by reading its name from the definition and
-                        // pairing it with the corresponding evaluated argument.
-                        for i in 0..num_args {
-                            let arg_name = match self.tokenizer.advance() {
-                                Token::Identifier(n) => n,
-                                t => {
-                                    return Err(InterpreterError::UnexpectedToken {
-                                        expected: Token::Identifier(&[]),
-                                        found: t,
+                                if num_args != nargs_on_stack {
+                                    return Err(InterpreterError::FunctionArgsMismatch {
+                                        expected: num_args,
+                                        got: nargs_on_stack,
+                                        name: None,
                                     });
                                 }
-                            };
-                            let value = self.expression_stack[args_start + i].clone();
-                            self.set_var(arg_name, value)?;
-                            if i < num_args - 1 {
-                                self.consume_token(&Token::Comma)?;
-                            }
-                        }
+                                self.tokenizer.set_cursor(position);
 
-                        // Clean up args from expression_stack now that they are bound as variables.
-                        self.expression_stack.truncate(args_start);
-
-                        // Consume ')' and '{' from the function *definition*.
-                        self.consume_token(&Token::CloseParen)?;
-                        self.consume_token(&Token::OpenBrace)?;
-
-                        // Execute the function body by driving step() until the Function scope
-                        // is popped. The scope was just pushed, so fn_scope_depth == current depth.
-                        // The return handler (explicit return) and the CloseBrace handler (implicit
-                        // Unit return) both pop the Function scope and push the result onto
-                        // expression_stack before jumping back to return_addr.
-                        let fn_scope_depth = self.scope_stack.len();
-                        loop {
-                            match self.step() {
-                                Ok(true) => {
-                                    if self.scope_stack.len() < fn_scope_depth {
-                                        break; // function scope was popped by return or '}'
+                                for i in 0..num_args {
+                                    let arg_name = match self.tokenizer.advance() {
+                                        Token::Identifier(n) => n,
+                                        t => {
+                                            return Err(InterpreterError::UnexpectedToken {
+                                                expected: Token::Identifier(&[]),
+                                                found: t,
+                                            });
+                                        }
+                                    };
+                                    let value = core::mem::replace(
+                                        &mut self.expression_stack[args_start + i],
+                                        EngineObject::Unit,
+                                    );
+                                    self.set_var(arg_name, value)?;
+                                    if i < num_args - 1 {
+                                        self.consume_token(&Token::Comma)?;
                                     }
                                 }
-                                Ok(false) => break, // EOF
-                                Err(e) => return Err(e),
+
+                                self.expression_stack.truncate(args_start);
+
+                                self.consume_token(&Token::CloseParen)?;
+                                self.consume_token(&Token::OpenBrace)?;
+
+                                let fn_scope_depth = self.scope_stack.len();
+                                loop {
+                                    match self.step() {
+                                        Ok(true) => {
+                                            if self.scope_stack.len() < fn_scope_depth {
+                                                break;
+                                            }
+                                        }
+                                        Ok(false) => break,
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
+                            EngineObject::ModuleMember { module: idx, name } => {
+                                // Call module directly — no scope push needed
+                                let result = {
+                                    let len = self.expression_stack.len();
+                                    let args = &self.expression_stack[len - nargs_on_stack..];
+                                    self.modules[idx].1.call(name, args)?
+                                };
+                                self.expression_stack.truncate(args_start);
+                                self.expression_stack
+                                    .try_push(result)
+                                    .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                            }
+                            obj => {
+                                return Err(InterpreterError::InvalidFunctionCall { obj });
                             }
                         }
 
@@ -1088,14 +1230,8 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
             }
 
             // Handle Dot Access
-            (EngineObject::Module(m), Token::Dot, EngineObject::MemberAccess { name }) => {
-                // Your member access logic here...
-                // e.g. *left = m.borrow().get_member(content)?;
-                // TODO: something like m.borrow_mut().call(name, args), but need to resolve args
-                unimplemented!(
-                    "Resolve member {} on module",
-                    core::str::from_utf8(name).unwrap()
-                );
+            (EngineObject::Module(idx), Token::Dot, EngineObject::MemberAccess { name }) => {
+                left = EngineObject::ModuleMember { module: *idx, name };
             }
 
             // Error
@@ -1141,96 +1277,97 @@ impl<'a, const STACK_SIZE: usize, const MAX_CALL_DEPTH: usize, const MAX_SCOPE_D
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use similar_asserts::assert_eq;
 
     #[test]
     fn test_simple_expr() {
-        let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 * 3");
-        assert_eq!(vm.eval_expr().unwrap(), 7.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"1 + 2 * 3");
+        assert_eq!(vm.eval_expr().unwrap(), 7.to_engine().unwrap());
     }
 
     #[test]
     fn test_simple_expr2() {
-        let mut vm: VmContext<'_> = VmContext::new(b"2 * 3 + 1");
-        assert_eq!(vm.eval_expr().unwrap(), 7.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"2 * 3 + 1");
+        assert_eq!(vm.eval_expr().unwrap(), 7.to_engine().unwrap());
     }
 
     #[test]
     fn long_expression() {
-        let mut vm: VmContext<'_> = VmContext::new(b"1 + 2 + 3 * 8 + 4 + 5");
-        assert_eq!(vm.eval_expr().unwrap(), 36.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"1 + 2 + 3 * 8 + 4 + 5");
+        assert_eq!(vm.eval_expr().unwrap(), 36.to_engine().unwrap());
     }
 
     #[test]
     fn simple_parens_expression() {
-        let mut vm: VmContext<'_> = VmContext::new(b"(1 + 2 + 3)");
-        assert_eq!(vm.eval_expr().unwrap(), 6.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 + 2 + 3)");
+        assert_eq!(vm.eval_expr().unwrap(), 6.to_engine().unwrap());
     }
     #[test]
     fn parens_expression() {
-        let mut vm: VmContext<'_> = VmContext::new(b"(1 + 2 + 3) * (8 + 4 + 5)");
-        assert_eq!(vm.eval_expr().unwrap(), 102.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 + 2 + 3) * (8 + 4 + 5)");
+        assert_eq!(vm.eval_expr().unwrap(), 102.to_engine().unwrap());
     }
 
     #[test]
     fn parens_nested() {
-        let mut vm: VmContext<'_> = VmContext::new(b"((1 + 2) * (3 + 4)) * 5");
-        assert_eq!(vm.eval_expr().unwrap(), 105.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"((1 + 2) * (3 + 4)) * 5");
+        assert_eq!(vm.eval_expr().unwrap(), 105.to_engine().unwrap());
     }
 
     #[test]
     fn parens_nested2() {
-        let mut vm: VmContext<'_> = VmContext::new(b"(1 * (2 * (3 * 4))) * 5");
-        assert_eq!(vm.eval_expr().unwrap(), 120.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 * (2 * (3 * 4))) * 5");
+        assert_eq!(vm.eval_expr().unwrap(), 120.to_engine().unwrap());
     }
 
     #[test]
     fn parens_nested3() {
-        let mut vm: VmContext<'_> = VmContext::new(b"5 * (4 * (3 * (2 * 1)))");
-        assert_eq!(vm.eval_expr().unwrap(), 120.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"5 * (4 * (3 * (2 * 1)))");
+        assert_eq!(vm.eval_expr().unwrap(), 120.to_engine().unwrap());
     }
 
     #[test]
     fn comparison_operators() {
-        let mut vm: VmContext<'_> = VmContext::new(b"(1 < 8)");
-        assert_eq!(vm.eval_expr().unwrap(), true.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 < 8)");
+        assert_eq!(vm.eval_expr().unwrap(), true.to_engine().unwrap());
     }
 
     #[test]
     fn unary_operators() {
-        let mut vm: VmContext<'_> = VmContext::new(b"-5");
-        assert_eq!(vm.eval_expr().unwrap(), (-5).into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"-5");
+        assert_eq!(vm.eval_expr().unwrap(), (-5).to_engine().unwrap());
     }
     #[test]
     fn unary_operators2() {
-        let mut vm: VmContext<'_> = VmContext::new(b"!5");
-        assert_eq!(vm.eval_expr().unwrap(), 0.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"!5");
+        assert_eq!(vm.eval_expr().unwrap(), 0.to_engine().unwrap());
     }
     #[test]
     fn unary_operators3() {
-        let mut vm: VmContext<'_> = VmContext::new(b"!0");
-        assert_eq!(vm.eval_expr().unwrap(), 1.into());
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"!0");
+        assert_eq!(vm.eval_expr().unwrap(), 1.to_engine().unwrap());
     }
 
     #[test]
     fn assign_variables() {
-        let mut vm: VmContext<'_> = VmContext::new(b"a = 5 + 5;");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"a = 5 + 5;");
         assert!(vm.run().is_ok());
-        assert_eq!(*vm.get_var(b"a").unwrap(), 10.into());
+        assert_eq!(*vm.get_var(b"a").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn assign_multiple_variables() {
-        let mut vm: VmContext<'_> = VmContext::new(b"a = 5 + 5; b = a + 5;");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"a = 5 + 5; b = a + 5;");
         assert!(vm.run().is_ok());
-        assert_eq!(*vm.get_var(b"a").unwrap(), 10.into());
-        assert_eq!(*vm.get_var(b"b").unwrap(), 15.into());
+        assert_eq!(*vm.get_var(b"a").unwrap(), 10.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"b").unwrap(), 15.to_engine().unwrap());
     }
 
     #[test]
     fn assign_too_many_variables() {
         // Limit stack to at most 2 variables
-        let mut vm: VmContext<'_, 2, 16, 8, 16> =
+        let mut vm: VmContext<'_, '_, 2, 16, 8, 16> =
             VmContext::new(b"a = 5 + 5; b = a + 5; c = b + a;");
         assert!(matches!(
             vm.run(),
@@ -1240,7 +1377,7 @@ mod tests {
 
     #[test]
     fn declare_function() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"fn test(a, b) { return a + b }
             fn test2() { return 7 }
         "#,
@@ -1271,7 +1408,7 @@ mod tests {
 
     #[test]
     fn if_else() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"a = 5;
             b = 0;
             if a > 3 {
@@ -1282,12 +1419,12 @@ mod tests {
         "#,
         );
         vm.run().expect("Running VM with if-else");
-        assert_eq!(*vm.get_var(b"b").unwrap(), 10.into());
+        assert_eq!(*vm.get_var(b"b").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn if_only() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"a = 5;
             b = 0;
             if a > 3 {
@@ -1296,12 +1433,12 @@ mod tests {
         "#,
         );
         vm.run().expect("Running VM with if-else");
-        assert_eq!(*vm.get_var(b"b").unwrap(), 10.into());
+        assert_eq!(*vm.get_var(b"b").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn if_nested() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"a = 5;
             b = 0;
             if a > 3 {
@@ -1312,23 +1449,23 @@ mod tests {
         "#,
         );
         vm.run().expect("Running VM with if-else");
-        assert_eq!(*vm.get_var(b"b").unwrap(), 10.into());
+        assert_eq!(*vm.get_var(b"b").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn function_call() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"fn val() { return 5; }
                 c = val();
             "#,
         );
         vm.run().expect("Running VM with function call");
-        assert_eq!(*vm.get_var(b"c").unwrap(), 5.into());
+        assert_eq!(*vm.get_var(b"c").unwrap(), 5.to_engine().unwrap());
     }
 
     #[test]
     fn stack_overflow() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"fn recurse() { return recurse(); }
                 recurse();
             "#,
@@ -1341,7 +1478,7 @@ mod tests {
 
     #[test]
     fn fibonacci() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br#"fn fib(n) {
                 if n <= 1 {
                     return n;
@@ -1353,64 +1490,64 @@ mod tests {
             "#,
         );
         vm.run().expect("Running VM with Fibonacci function");
-        assert_eq!(*vm.get_var(b"result").unwrap(), 55.into());
+        assert_eq!(*vm.get_var(b"result").unwrap(), 55.to_engine().unwrap());
     }
 
     #[test]
     fn function_call_two_args() {
-        let mut vm: VmContext<'_> =
+        let mut vm: VmContext<'_, '_> =
             VmContext::new(b"fn add(a, b) { return a + b; }\nresult = add(2, 3);");
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), 5.into());
+        assert_eq!(*vm.get_var(b"result").unwrap(), 5.to_engine().unwrap());
     }
 
     #[test]
     fn function_call_implicit_unit() {
-        let mut vm: VmContext<'_> = VmContext::new(b"fn noop() {}\nresult = noop();");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"fn noop() {}\nresult = noop();");
         vm.run().unwrap();
         assert_eq!(*vm.get_var(b"result").unwrap(), EngineObject::Unit);
     }
 
     #[test]
     fn function_call_in_expression() {
-        let mut vm: VmContext<'_> =
+        let mut vm: VmContext<'_, '_> =
             VmContext::new(b"fn add(a, b) { return a + b; }\nresult = add(2, 3) + 1;");
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), 6.into());
+        assert_eq!(*vm.get_var(b"result").unwrap(), 6.to_engine().unwrap());
     }
 
     #[test]
     fn nested_function_call_as_arg() {
-        let mut vm: VmContext<'_> = VmContext::new(b"fn double(x) { return x * 2; }\nfn add(a, b) { return a + b; }\nresult = add(double(2), 3);");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"fn double(x) { return x * 2; }\nfn add(a, b) { return a + b; }\nresult = add(double(2), 3);");
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), 7.into());
+        assert_eq!(*vm.get_var(b"result").unwrap(), 7.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_basic() {
-        let mut vm: VmContext<'_> = VmContext::new(b"i = 0;\nwhile i < 3 {\ni = i + 1;\n}");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"i = 0;\nwhile i < 3 {\ni = i + 1;\n}");
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"i").unwrap(), 3.into());
+        assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_never_executes() {
-        let mut vm: VmContext<'_> = VmContext::new(b"i = 5;\nwhile i < 3 {\ni = i + 1;\n}");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"i = 5;\nwhile i < 3 {\ni = i + 1;\n}");
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"i").unwrap(), 5.into());
+        assert_eq!(*vm.get_var(b"i").unwrap(), 5.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_accumulates() {
-        let mut vm: VmContext<'_> =
+        let mut vm: VmContext<'_, '_> =
             VmContext::new(b"i = 0;\nsum = 0;\nwhile i < 5 {\nsum = sum + i;\ni = i + 1;\n}");
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 10.into());
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_continue() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br"
             i = 0;
             sum = 0;
@@ -1424,13 +1561,13 @@ mod tests {
             }",
         );
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 4.into());
-        assert_eq!(*vm.get_var(b"i").unwrap(), 4.into());
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 4.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"i").unwrap(), 4.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_break() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br"
             i = 0;
             sum = 0;
@@ -1443,13 +1580,13 @@ mod tests {
             }",
         );
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 1.into());
-        assert_eq!(*vm.get_var(b"i").unwrap(), 2.into());
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 1.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"i").unwrap(), 2.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_nested() {
-        let mut vm: VmContext<'_> = VmContext::new(
+        let mut vm: VmContext<'_, '_> = VmContext::new(
             br"
             i = 0;
             sum = 0;
@@ -1465,12 +1602,12 @@ mod tests {
             }",
         );
         vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 9.into());
+        assert_eq!(*vm.get_var(b"sum").unwrap(), 9.to_engine().unwrap());
     }
 
     #[test]
     fn continue_outside_loop() {
-        let mut vm: VmContext<'_> = VmContext::new(b"continue;");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"continue;");
         assert!(matches!(
             vm.run(),
             Err(InterpreterError::ContinueOutsideLoop)
@@ -1479,7 +1616,50 @@ mod tests {
 
     #[test]
     fn break_outside_loop() {
-        let mut vm: VmContext<'_> = VmContext::new(b"if true { break; }");
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"if true { break; }");
         assert!(matches!(vm.run(), Err(InterpreterError::BreakOutsideLoop)));
+    }
+
+    #[derive(EngineModule)]
+    struct MathModule {}
+    #[script_module]
+    impl MathModule {
+        pub fn add(&self, a: i32, b: i32) -> i32 {
+            a + b
+        }
+    }
+
+    #[test]
+    fn math_module() {
+        let mut math = MathModule {};
+        let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.add(1, 2);")
+            .add_module(b"math", &mut math)
+            .unwrap();
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
+    }
+
+    use nova_macros::{EngineModule, script_module};
+    #[derive(EngineModule)]
+    struct FancyMathModule {
+        MAX_INT: i32,
+    }
+
+    #[test]
+    fn math_module_fancy() {
+        let mut math = FancyMathModule { MAX_INT: 100 };
+        let mut vm: VmContext<'_, '_> =
+            VmContext::new(b"import fancy_math; i = fancy_math.MAX_INT;")
+                .add_module(b"fancy_math", &mut math)
+                .unwrap();
+        vm.run().unwrap();
+        assert_eq!(*vm.get_var(b"i").unwrap(), 100.to_engine().unwrap());
+    }
+
+    #[script_module]
+    impl FancyMathModule {
+        fn set_max(&mut self, max: i32) {
+            self.MAX_INT = max;
+        }
     }
 }

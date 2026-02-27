@@ -14,6 +14,8 @@ pub enum Token<'a> {
     CloseBrace,
     Comma,
     Dot,
+    Import,
+    As,
 
     // ; or newline (both \n and \r\n)
     Separator,
@@ -255,6 +257,8 @@ impl<'a> Tokenizer<'a> {
                         b"break" => Token::Break,
                         b"true" => Token::BooleanLit(true),
                         b"false" => Token::BooleanLit(false),
+                        b"import" => Token::Import,
+                        b"as" => Token::As,
                         _ => Token::Identifier(text),
                     };
                     return (token, cursor, Some(token));

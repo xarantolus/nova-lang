@@ -54,7 +54,17 @@ name = "nova"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "nova_macros",
  "similar-asserts",
+]
+
+[[package]]
+name = "nova_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
