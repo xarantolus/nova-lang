@@ -1122,17 +1122,6 @@ impl<
         Ok(obj)
     }
 
-    /// Thin wrapper for tests and other call sites that don't expect suspension.
-    fn eval_expr(&mut self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-        let ops_len = self.expression_operator_stack.len();
-        match self.eval_expr_internal(ops_len, true)? {
-            EvaluationResult::Value(v) => Ok(v),
-            EvaluationResult::Suspended => {
-                unreachable!("eval_expr called in context where suspension is not handled")
-            }
-        }
-    }
-
     /// Core expression evaluator. Returns `Suspended` instead of recursing into user-defined
     /// function bodies. `initial_ops_len` is the operator-stack watermark for this level;
     /// `expect_operand` is true when the next token should be a value/operand.
@@ -1837,73 +1826,69 @@ mod tests {
 
     use similar_asserts::assert_eq;
 
+    fn assert_expr(input: &[u8], expected: EngineObject) {
+        let code = Box::leak(Box::new([b"result = ", input].concat()));
+        let mut vm: VmContext<'_, '_> = VmContext::new(&code);
+        vm.run().unwrap();
+        let actual = vm.get_var(b"result").unwrap();
+        assert_eq!(actual, &expected);
+    }
+
     #[test]
     fn test_simple_expr() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"1 + 2 * 3");
-        assert_eq!(vm.eval_expr().unwrap(), 7.to_engine().unwrap());
+        assert_expr(b"1 + 2 * 3", 7.to_engine().unwrap());
     }
 
     #[test]
     fn test_simple_expr2() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"2 * 3 + 1");
-        assert_eq!(vm.eval_expr().unwrap(), 7.to_engine().unwrap());
+        assert_expr(b"2 * 3 + 1", 7.to_engine().unwrap());
     }
 
     #[test]
     fn long_expression() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"1 + 2 + 3 * 8 + 4 + 5");
-        assert_eq!(vm.eval_expr().unwrap(), 36.to_engine().unwrap());
+        assert_expr(b"1 + 2 + 3 * 8 + 4 + 5", 36.to_engine().unwrap());
     }
 
     #[test]
     fn simple_parens_expression() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 + 2 + 3)");
-        assert_eq!(vm.eval_expr().unwrap(), 6.to_engine().unwrap());
+        assert_expr(b"(1 + 2 + 3)", 6.to_engine().unwrap());
     }
     #[test]
     fn parens_expression() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 + 2 + 3) * (8 + 4 + 5)");
-        assert_eq!(vm.eval_expr().unwrap(), 102.to_engine().unwrap());
+        assert_expr(b"(1 + 2 + 3) * (8 + 4 + 5)", 102.to_engine().unwrap());
     }
 
     #[test]
     fn parens_nested() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"((1 + 2) * (3 + 4)) * 5");
-        assert_eq!(vm.eval_expr().unwrap(), 105.to_engine().unwrap());
+        assert_expr(b"((1 + 2) * (3 + 4)) * 5", 105.to_engine().unwrap());
     }
 
     #[test]
     fn parens_nested2() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 * (2 * (3 * 4))) * 5");
-        assert_eq!(vm.eval_expr().unwrap(), 120.to_engine().unwrap());
+        assert_expr(b"(1 * (2 * (3 * 4))) * 5", 120.to_engine().unwrap());
     }
 
     #[test]
     fn parens_nested3() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"5 * (4 * (3 * (2 * 1)))");
-        assert_eq!(vm.eval_expr().unwrap(), 120.to_engine().unwrap());
+        assert_expr(b"5 * (4 * (3 * (2 * 1)))", 120.to_engine().unwrap());
     }
 
     #[test]
     fn comparison_operators() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"(1 < 8)");
-        assert_eq!(vm.eval_expr().unwrap(), true.to_engine().unwrap());
+        assert_expr(b"(1 < 8)", true.to_engine().unwrap());
     }
 
     #[test]
     fn unary_operators() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"-5");
-        assert_eq!(vm.eval_expr().unwrap(), (-5).to_engine().unwrap());
+        assert_expr(b"-5", (-5).to_engine().unwrap());
     }
     #[test]
     fn unary_operators2() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"!5");
-        assert_eq!(vm.eval_expr().unwrap(), 0.to_engine().unwrap());
+        assert_expr(b"!5", 0.to_engine().unwrap());
     }
     #[test]
     fn unary_operators3() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"!0");
-        assert_eq!(vm.eval_expr().unwrap(), 1.to_engine().unwrap());
+        assert_expr(b"!0", 1.to_engine().unwrap());
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl<'a> Tokenizer<'a> {
         mut cursor: usize,
         last_token: Option<Token<'a>>,
     ) -> (Token<'a>, usize, Option<Token<'a>>) {
-        loop {
+        'scanner: loop {
             // 1. Skip spaces and tabs ONLY
             while cursor < input.len() {
                 let b = input[cursor];
@@ -292,6 +292,21 @@ impl<'a> Tokenizer<'a> {
                         _ => Token::Identifier(text),
                     };
                     return (token, cursor, Some(token));
+                }
+
+                b'#' => {
+                    // Comment until end of line
+                    loop {
+                        if cursor >= input.len() {
+                            // End of file handled above
+                            continue 'scanner;
+                        }
+                        if input[cursor] == b'\n' {
+                            cursor += 1;
+                            continue 'scanner;
+                        }
+                        cursor += 1;
+                    }
                 }
 
                 _ => return (Token::Error, cursor, Some(Token::Error)),
