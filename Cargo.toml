@@ -1,3 +1,9 @@
+workspace = { members = [
+	".",
+	"fuzz",
+	"nova_macros",
+] }
+
 [package]
 name = "nova"
 version = "0.1.0"
