@@ -249,13 +249,22 @@ pub enum InterpreterError<'a> {
     /// A module import failed because the module name was not found in the registered modules.
     ModuleNotResolved(&'a [u8]),
     /// An expression resulted in a value that cannot be used, e.g. trying to use a string literal as a condition.
-    InvalidExpressionResult { obj: EngineObject<'a> },
+    InvalidExpressionResult {
+        obj: EngineObject<'a>,
+    },
     /// A nonexistent function call was done on a module, or with the wrong number of arguments.
-    InvalidModuleFunctionCall { func: &'a [u8], nargs: usize },
+    InvalidModuleFunctionCall {
+        func: &'a [u8],
+        nargs: usize,
+    },
     /// A nonexistent member was accessed on a module.
-    InvalidModuleMemberAccess { member: &'a [u8] },
+    InvalidModuleMemberAccess {
+        member: &'a [u8],
+    },
     /// Function call on a non-function object.
-    InvalidFunctionCall { obj: EngineObject<'a> },
+    InvalidFunctionCall {
+        obj: EngineObject<'a>,
+    },
     /// Unary operation on a type that does not support it, e.g. negation on a string.
     InvalidUnaryOperation {
         op: Token<'a>,
@@ -324,6 +333,8 @@ pub enum InterpreterError<'a> {
     },
     /// Division by zero error, e.g. "5 / 0"
     DivisionByZero,
+    // When execution finishes, but not all scopes were closed
+    InvalidEndScope,
 }
 
 impl InterpreterError<'_> {
@@ -415,7 +426,62 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
                     expected, found
                 )
             }
-            other => write!(f, "{:?}", other),
+            InterpreterError::FunctionArgsMismatch {
+                expected,
+                got,
+                name,
+            } => {
+                write!(
+                    f,
+                    "Function argument count mismatch for {}: expected {}, got {}",
+                    name.map_or("<anonymous>", |n| core::str::from_utf8(n)
+                        .unwrap_or("<invalid utf-8>")),
+                    expected,
+                    got
+                )
+            }
+            InterpreterError::BreakOutsideLoop => write!(f, "Break statement outside of loop"),
+            InterpreterError::ContinueOutsideLoop => {
+                write!(f, "Continue statement outside of loop")
+            }
+            InterpreterError::ScopeStackEmpty => {
+                write!(f, "Scope stack was empty when popping a scope")
+            }
+            InterpreterError::ScopeStackExhausted => write!(f, "Scope stack exhausted"),
+            InterpreterError::ExpressionStackEmpty => write!(
+                f,
+                "Expression stack was empty when popping an expression result"
+            ),
+            InterpreterError::ExpressionStackOverflow => {
+                write!(f, "Expression stack overflow (expression tree too deep)")
+            }
+            InterpreterError::TooManyOperations => {
+                write!(f, "Exceeded maximum number of operations")
+            }
+            InterpreterError::VariableStackOverflow => {
+                write!(
+                    f,
+                    "Variable stack overflow (too many variables in all scope)"
+                )
+            }
+            InterpreterError::TooManyModules => {
+                write!(f, "Cannot add more modules: maximum reached")
+            }
+            InterpreterError::UnexpectedEoF => {
+                write!(f, "Unexpected end of file while parsing")
+            }
+            InterpreterError::OperatorOverflow { op, .. } => {
+                write!(f, "Overflow while applying operator {:?}", op)
+            }
+            InterpreterError::DivisionByZero => {
+                write!(f, "Division by zero")
+            }
+            InterpreterError::InvalidEndScope => {
+                write!(
+                    f,
+                    "Invalid end of scope: not all scopes were closed at end of execution"
+                )
+            }
         }?;
 
         if let Some((pos, program)) = self.program_info() {
@@ -623,10 +689,9 @@ impl<
             }
         }
         // When finished, we should only have the global scope left
-        debug_assert!(
-            self.scope_stack.len() == 1,
-            "scope stack should be back to global scope at end of execution"
-        );
+        if self.scope_stack.len() != 1 || !matches!(self.scope_stack[0], BlockScope::Normal) {
+            return Err(InterpreterError::InvalidEndScope);
+        }
         Ok(())
     }
 
@@ -775,7 +840,8 @@ impl<
                 self.enter_scope(BlockScope::Return)?;
                 match rest {
                     Token::Separator | Token::Eof => {
-                        return self.handle_evaluation_result(EvaluationResult::Value(EngineObject::Unit));
+                        return self
+                            .handle_evaluation_result(EvaluationResult::Value(EngineObject::Unit));
                     }
                     _ => {
                         let ops_len = self.expression_operator_stack.len();
@@ -823,7 +889,10 @@ impl<
                 self.variables.truncate(self.variables.len() - var_count);
 
                 match block {
-                    BlockScope::Function { return_addr, caller_ops_len } => {
+                    BlockScope::Function {
+                        return_addr,
+                        caller_ops_len,
+                    } => {
                         // function ends without return statement -> return unit
                         self.expression_stack
                             .try_push(EngineObject::Unit)
@@ -1237,9 +1306,9 @@ impl<
                                     let ops_for_arg = self.expression_operator_stack.len();
                                     match self.eval_expr_internal(ops_for_arg, true)? {
                                         EvaluationResult::Value(v) => {
-                                            self.expression_stack
-                                                .try_push(v)
-                                                .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                                            self.expression_stack.try_push(v).map_err(|_| {
+                                                InterpreterError::ExpressionStackOverflow
+                                            })?;
                                             nargs_so_far += 1;
                                         }
                                         EvaluationResult::Suspended => {
@@ -1254,7 +1323,9 @@ impl<
                                                     args_start,
                                                     outer_ops_len: initial_ops_len,
                                                 })
-                                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                                                .map_err(|_| {
+                                                    InterpreterError::ScopeStackExhausted
+                                                })?;
                                             return Ok(EvaluationResult::Suspended);
                                         }
                                     }
@@ -1316,9 +1387,9 @@ impl<
                                     let ops_for_arg = self.expression_operator_stack.len();
                                     match self.eval_expr_internal(ops_for_arg, true)? {
                                         EvaluationResult::Value(v) => {
-                                            self.expression_stack
-                                                .try_push(v)
-                                                .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                                            self.expression_stack.try_push(v).map_err(|_| {
+                                                InterpreterError::ExpressionStackOverflow
+                                            })?;
                                             nargs_so_far += 1;
                                         }
                                         EvaluationResult::Suspended => {
@@ -1331,14 +1402,17 @@ impl<
                                                     args_start,
                                                     outer_ops_len: initial_ops_len,
                                                 })
-                                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                                                .map_err(|_| {
+                                                    InterpreterError::ScopeStackExhausted
+                                                })?;
                                             return Ok(EvaluationResult::Suspended);
                                         }
                                     }
                                     is_first = false;
                                 }
                                 let result = {
-                                    let args = &self.expression_stack[args_start..args_start + nargs_so_far];
+                                    let args = &self.expression_stack
+                                        [args_start..args_start + nargs_so_far];
                                     self.modules[idx].1.call(name, args)?
                                 };
                                 self.expression_stack.truncate(args_start);
@@ -1353,8 +1427,7 @@ impl<
                         }
                     }
                     Token::CloseParen => {
-                        let has_matching_paren = self.expression_operator_stack
-                            [initial_ops_len..]
+                        let has_matching_paren = self.expression_operator_stack[initial_ops_len..]
                             .iter()
                             .any(|(t, _)| *t == Token::OpenParen);
 
@@ -1538,7 +1611,8 @@ impl<
                                 break (return_addr, caller_ops_len);
                             }
                         };
-                        self.variables.truncate(self.variables.len() - vars_to_remove);
+                        self.variables
+                            .truncate(self.variables.len() - vars_to_remove);
                         self.expression_stack
                             .try_push(value)
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
@@ -2250,7 +2324,7 @@ mod tests {
 
     #[test]
     fn test_sibling() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
+        let mut vm: VmContext<'_, '_, 32, 32> = VmContext::new(
             br#"
             fn is_even(n) {
                 if n == 0 {
@@ -2269,6 +2343,31 @@ mod tests {
         );
         vm.run().expect("Running VM with sibling functions");
         assert_eq!(*vm.get_var(b"result").unwrap(), true.to_engine().unwrap());
+    }
+
+    #[test]
+    fn test_sibling_stack_overflow() {
+        let mut vm: VmContext<'_, '_, 32, 32> = VmContext::new(
+            br#"
+            fn is_even(n) {
+                if n == 0 {
+                    return true;
+                } else {
+                    return is_odd(n - 1);
+                }
+            }
+
+            fn is_odd(n) {
+                return is_even(n - 1);
+            }
+
+            result = is_even(5);
+            "#,
+        );
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::ScopeStackExhausted)
+        ));
     }
 
     #[test]
