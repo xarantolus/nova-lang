@@ -2426,4 +2426,20 @@ mod tests {
         assert_eq!(*vm.get_var(b"d").unwrap(), true.to_engine().unwrap());
         assert_eq!(*vm.get_var(b"e").unwrap(), false.to_engine().unwrap());
     }
+
+    #[test]
+    fn test_stack_overflow() {
+        let mut vm: VmContext<'_, '_, 32, 32> = VmContext::new(
+            br#"
+            fn is_even(n) {
+                return is_even(n+1);
+            }
+            is_even(0);
+            "#,
+        );
+        assert!(matches!(
+            vm.run(),
+            Err(InterpreterError::ScopeStackExhausted)
+        ));
+    }
 }
