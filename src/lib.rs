@@ -462,8 +462,16 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
         Ok(())
     }
 }
+/// Enum to track the result of an expression evaluation.
+enum EvaluationResult<'a> {
+    /// The expression calculated a final value immediately.
+    Value(EngineObject<'a>),
+    /// The expression encountered a function call and has paused execution.
+    /// The VM should continue the main loop to execute the function body.
+    Suspended,
+}
 
-enum BlockScope {
+enum BlockScope<'a> {
     Normal,
     While {
         /// Cursor position immediately after the `while` keyword,
@@ -475,7 +483,31 @@ enum BlockScope {
     Function {
         // frame pointer for this function call
         return_addr: usize,
+        /// The length of the operator stack when this function was called.
+        /// We need this to restore the expression parsing context upon return.
+        caller_ops_len: usize,
     },
+    /// We are evaluating the RHS of an assignment: `name = <expr>`
+    Assignment {
+        name: &'a [u8],
+    },
+    /// We are evaluating a return value: `return <expr>`
+    Return,
+    /// We are evaluating an If condition: `if <expr>`
+    IfCondition,
+    /// We are evaluating a While condition: `while <expr>`
+    WhileCondition {
+        condition_start: usize,
+    },
+    /// We are evaluating a standalone expression statement: `<expr>;`
+    ExpressionStatement,
+}
+
+/// State saved when we've suspended mid-argument-list for a user-defined function call.
+struct FunctionArgState<'a> {
+    function_object: EngineObject<'a>,
+    args_start: usize,
+    outer_ops_len: usize,
 }
 
 /// Named variable and value.
@@ -503,7 +535,7 @@ pub struct VmContext<
     variables: ArrayVec<Variable<'a>, STACK_SIZE>,
 
     // We keep track of block/loop/function frames.
-    scope_stack: ArrayVec<BlockScope, MAX_SCOPE_DEPTH>,
+    scope_stack: ArrayVec<BlockScope<'a>, MAX_SCOPE_DEPTH>,
     current_block_scope: ArrayVec<usize, MAX_SCOPE_DEPTH>,
 
     modules: ArrayVec<(&'m [u8], &'m mut dyn Module), MAX_MODULES>,
@@ -517,6 +549,12 @@ pub struct VmContext<
 
     tokenizer: Tokenizer<'a>,
     // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
+    /// If Some, the VM is currently resuming an expression after a function return.
+    /// The value is the `initial_ops_stack_len` to pass to the expression parser.
+    resume_expression: Option<usize>,
+    /// Stack of suspended function-argument-collection states.
+    /// Pushed when eval_expr_internal suspends mid-arg-list; popped in continue_args.
+    arg_eval_stack: ArrayVec<FunctionArgState<'a>, MAX_SCOPE_DEPTH>,
 }
 
 impl<
@@ -546,6 +584,8 @@ impl<
             modules: ArrayVec::new_const(),
             operations_limit: usize::MAX,
             current_operations: 0,
+            resume_expression: None,
+            arg_eval_stack: ArrayVec::new_const(),
         };
         // global context starts with 0 objects
         unsafe {
@@ -579,9 +619,10 @@ impl<
             match self.step() {
                 Err(e) => return Err(e),
                 Ok(false) => break,
-                _ => {}
+                Ok(true) => {}
             }
         }
+        // When finished, we should only have the global scope left
         debug_assert!(
             self.scope_stack.len() == 1,
             "scope stack should be back to global scope at end of execution"
@@ -600,6 +641,24 @@ impl<
     // Returns: Ok(true) if work was done, Ok(false) if EOF, Err on error
     pub fn step(&mut self) -> Result<bool, InterpreterError<'a>> {
         self.check_operations_limit()?;
+
+        if let Some(ops_len) = self.resume_expression {
+            self.resume_expression = None;
+            // Resume expression parsing expecting an operator (since we just got a value back)
+            let mut result = self.eval_expr_internal(ops_len, false)?;
+            loop {
+                match result {
+                    EvaluationResult::Suspended => return Ok(true),
+                    EvaluationResult::Value(v) => {
+                        if !self.arg_eval_stack.is_empty() {
+                            result = self.continue_args(v)?;
+                        } else {
+                            return self.handle_evaluation_result(EvaluationResult::Value(v));
+                        }
+                    }
+                }
+            }
+        }
 
         let (first_token, second_token) = self.tokenizer.peek2();
 
@@ -638,14 +697,12 @@ impl<
                 self.consume_separator()?;
             }
             (Token::Identifier(var_name), Token::Assign) => {
-                // Skip both
                 self.tokenizer.advance();
                 self.tokenizer.advance();
-
-                let value = self.eval_expr()?;
-                self.consume_separator()?;
-
-                self.set_var(var_name, value)?;
+                self.enter_scope(BlockScope::Assignment { name: var_name })?;
+                let ops_len = self.expression_operator_stack.len();
+                let result = self.eval_expr_internal(ops_len, true)?;
+                return self.handle_evaluation_result(result);
             }
             (Token::Fn, Token::Identifier(function_name)) => {
                 self.consume_token(&Token::Fn)?;
@@ -699,28 +756,10 @@ impl<
             }
             (Token::If, _) => {
                 self.tokenizer.advance();
-                let expression_res = self.eval_expr()?.is_true()?;
-
-                self.consume_token(&Token::OpenBrace)?;
-
-                if expression_res {
-                    self.enter_scope(BlockScope::If)?;
-                } else {
-                    // Skip block, expect else or nothing
-                    self.skip_block(None)?;
-
-                    // there may be an else block, or nothing
-                    let next = self.tokenizer.peek();
-                    if next != Token::Else {
-                        self.consume_separator()?;
-                        return Ok(true);
-                    }
-                    self.consume_token(&Token::Else)?;
-                    self.consume_token(&Token::OpenBrace)?;
-                    self.enter_scope(BlockScope::Else)?;
-                }
-
-                // Now we are in the correct block
+                self.enter_scope(BlockScope::IfCondition)?;
+                let ops_len = self.expression_operator_stack.len();
+                let result = self.eval_expr_internal(ops_len, true)?;
+                return self.handle_evaluation_result(result);
             }
             (Token::Else, _) => {
                 // If we hit this, we have an else without a matching if...
@@ -732,61 +771,31 @@ impl<
                 });
             }
             (Token::Return, rest) => {
-                // Empty, separator, or expression
                 self.tokenizer.advance();
-
-                let result_expression = match rest {
-                    Token::Separator | Token::Eof => EngineObject::Unit,
-                    _ => self.eval_expr()?,
-                };
-                self.consume_separator()?;
-
-                let mut vars_to_remove = 0;
-                let return_address = loop {
-                    let Some(scope) = self.scope_stack.pop() else {
-                        return Err(InterpreterError::ScopeStackEmpty);
-                    };
-                    vars_to_remove += self
-                        .current_block_scope
-                        .pop()
-                        .ok_or(InterpreterError::ScopeStackEmpty)?;
-
-                    if let BlockScope::Function { return_addr } = scope {
-                        // We found the function, now we just need to jump back to the return address and clean up the stack
-                        break return_addr;
+                self.enter_scope(BlockScope::Return)?;
+                match rest {
+                    Token::Separator | Token::Eof => {
+                        return self.handle_evaluation_result(EvaluationResult::Value(EngineObject::Unit));
                     }
-                };
-
-                self.variables
-                    .truncate(self.variables.len() - vars_to_remove);
-
-                self.expression_stack
-                    .try_push(result_expression)
-                    .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
-                self.tokenizer.set_cursor(return_address);
+                    _ => {
+                        let ops_len = self.expression_operator_stack.len();
+                        let result = self.eval_expr_internal(ops_len, true)?;
+                        return self.handle_evaluation_result(result);
+                    }
+                }
             }
             (Token::While, _) => {
-                self.tokenizer.advance(); // consume 'while'
-                let condition_start = self.tokenizer.cursor_pos(); // before condition
-
-                let expression_res = self.eval_expr()?.is_true()?;
-                self.consume_token(&Token::OpenBrace)?;
-                // cursor is now at body_start
-
-                if expression_res {
-                    self.enter_scope(BlockScope::While { condition_start })?;
-                    // cursor stays at body_start
-                } else {
-                    self.skip_block(None)?;
-                    // cursor is now after '}'
-                    self.consume_separator()?;
-                }
+                self.tokenizer.advance();
+                let condition_start = self.tokenizer.cursor_pos();
+                self.enter_scope(BlockScope::WhileCondition { condition_start })?;
+                let ops_len = self.expression_operator_stack.len();
+                let result = self.eval_expr_internal(ops_len, true)?;
+                return self.handle_evaluation_result(result);
             }
             (Token::Continue, _) => {
                 self.tokenizer.advance();
                 let (loop_condition_pos, _) = self.pop_loop(true)?;
-                self.evaluate_while_condition(loop_condition_pos)?;
+                return self.evaluate_while_condition(loop_condition_pos);
             }
             (Token::Break, _) => {
                 self.tokenizer.advance();
@@ -814,13 +823,13 @@ impl<
                 self.variables.truncate(self.variables.len() - var_count);
 
                 match block {
-                    BlockScope::Function { return_addr } => {
+                    BlockScope::Function { return_addr, caller_ops_len } => {
                         // function ends without return statement -> return unit
                         self.expression_stack
                             .try_push(EngineObject::Unit)
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                         self.tokenizer.set_cursor(return_addr);
-                        // Do NOT consume_separator here — the call site handles its own separator.
+                        self.resume_expression = Some(caller_ops_len);
                     }
                     BlockScope::If => {
                         // If ended, skip over else block if present
@@ -833,8 +842,7 @@ impl<
                         self.consume_separator()?;
                     }
                     BlockScope::While { condition_start } => {
-                        // Re-evaluate the condition
-                        self.evaluate_while_condition(condition_start)?;
+                        return self.evaluate_while_condition(condition_start);
                     }
                     _ => {
                         self.consume_separator()?;
@@ -844,8 +852,10 @@ impl<
             (Token::Separator, Token::Eof) | (Token::Eof, _) => return Ok(false),
             // Anything else is just an expression, e.g. a function call
             _ => {
-                self.eval_expr()?;
-                self.consume_separator()?;
+                self.enter_scope(BlockScope::ExpressionStatement)?;
+                let ops_len = self.expression_operator_stack.len();
+                let result = self.eval_expr_internal(ops_len, true)?;
+                return self.handle_evaluation_result(result);
             }
         }
 
@@ -879,7 +889,7 @@ impl<
         }
     }
 
-    fn enter_scope(&mut self, scope: BlockScope) -> Result<(), InterpreterError<'a>> {
+    fn enter_scope(&mut self, scope: BlockScope<'a>) -> Result<(), InterpreterError<'a>> {
         self.scope_stack
             .try_push(scope)
             .map_err(|_| InterpreterError::ScopeStackExhausted)?;
@@ -892,22 +902,12 @@ impl<
     fn evaluate_while_condition(
         &mut self,
         condition_start: usize,
-    ) -> Result<(), InterpreterError<'a>> {
-        let body_end = self.tokenizer.cursor_pos(); // right after '}'
+    ) -> Result<bool, InterpreterError<'a>> {
         self.tokenizer.set_cursor(condition_start);
-        let continue_loop = self.eval_expr()?.is_true()?;
-        self.consume_token(&Token::OpenBrace)?;
-        // cursor is now at body_start
-
-        if continue_loop {
-            self.enter_scope(BlockScope::While { condition_start })?;
-            // cursor stays at body_start
-        } else {
-            self.tokenizer.set_cursor(body_end);
-            self.consume_separator()?;
-        }
-
-        Ok(())
+        self.enter_scope(BlockScope::WhileCondition { condition_start })?;
+        let ops_len = self.expression_operator_stack.len();
+        let result = self.eval_expr_internal(ops_len, true)?;
+        self.handle_evaluation_result(result)
     }
 
     /// Consumes next tokens, ensuring it is the expected one, otherwise returns an error.
@@ -1053,12 +1053,25 @@ impl<
         Ok(obj)
     }
 
-    /// Evaluate expressions
+    /// Thin wrapper for tests and other call sites that don't expect suspension.
     fn eval_expr(&mut self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-        let mut expect_operand = true;
-        let initial_ops_stack_len = self.expression_operator_stack.len();
+        let ops_len = self.expression_operator_stack.len();
+        match self.eval_expr_internal(ops_len, true)? {
+            EvaluationResult::Value(v) => Ok(v),
+            EvaluationResult::Suspended => {
+                unreachable!("eval_expr called in context where suspension is not handled")
+            }
+        }
+    }
 
-        // We use the VmContext expression stack to prevent actual runtime stack overflows.
+    /// Core expression evaluator. Returns `Suspended` instead of recursing into user-defined
+    /// function bodies. `initial_ops_len` is the operator-stack watermark for this level;
+    /// `expect_operand` is true when the next token should be a value/operand.
+    fn eval_expr_internal(
+        &mut self,
+        initial_ops_len: usize,
+        mut expect_operand: bool,
+    ) -> Result<EvaluationResult<'a>, InterpreterError<'a>> {
         loop {
             self.check_operations_limit()?;
             if expect_operand {
@@ -1067,14 +1080,12 @@ impl<
                         self.expression_stack
                             .try_push(EngineObject::Bool(b))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
                         expect_operand = false;
                     }
                     Token::IntegerLit(i) => {
                         self.expression_stack
                             .try_push(EngineObject::Int(i))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
                         expect_operand = false;
                     }
                     Token::StringLit {
@@ -1087,7 +1098,6 @@ impl<
                                 has_escape_characters,
                             })
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
                         expect_operand = false;
                     }
                     Token::Identifier(id) => {
@@ -1095,33 +1105,28 @@ impl<
                         self.expression_stack
                             .try_push(var)
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
                         expect_operand = false;
                     }
                     Token::OpenParen => {
-                        // Push sentinel with 0 precedence so nothing pops it until RParen
                         self.expression_operator_stack
                             .try_push((Token::OpenParen, 0))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
-                        // we don't change expect_operand here!
+                        // expect_operand stays true
                     }
-                    // Unary operators
                     Token::Bang => {
                         self.expression_operator_stack
-                            .try_push((Token::Bang, 255)) // highest precedence for unary ops
+                            .try_push((Token::Bang, 255))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     }
                     Token::Plus => {
-                        // Can be ignored
+                        // unary plus: ignored
                     }
                     Token::Minus => {
-                        // push a "0-..." onto the stack, to turn unary minus into binary
                         self.expression_stack
                             .try_push(EngineObject::Int(0))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                         self.expression_operator_stack
-                            .try_push((Token::Minus, 255)) // highest precedence for unary ops
+                            .try_push((Token::Minus, 255))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
                     }
                     token => {
@@ -1133,7 +1138,7 @@ impl<
                     }
                 }
             } else {
-                // Expecting operators
+                // Expecting an operator
                 let op = self.tokenizer.peek();
                 match op {
                     Token::Equals
@@ -1146,9 +1151,10 @@ impl<
                     | Token::Plus
                     | Token::Minus
                     | Token::Star
-                    | Token::Slash => {
+                    | Token::Slash
+                    | Token::Percent => {
                         let (lbp, rbp) = self.infix_binding_power(&op).unwrap();
-                        while initial_ops_stack_len < self.expression_operator_stack.len()
+                        while initial_ops_len < self.expression_operator_stack.len()
                             && let Some((_, top_bp)) = self.expression_operator_stack.last()
                         {
                             if *top_bp >= lbp {
@@ -1157,18 +1163,15 @@ impl<
                                 break;
                             }
                         }
-
-                        let _ = self.consume_token(&op)?;
+                        self.consume_token(&op)?;
                         self.expression_operator_stack
                             .try_push((op, rbp))
                             .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-
                         expect_operand = true;
                     }
                     Token::Dot => {
                         let lbp = 100;
-
-                        while initial_ops_stack_len < self.expression_operator_stack.len()
+                        while initial_ops_len < self.expression_operator_stack.len()
                             && let Some((_, top_bp)) = self.expression_operator_stack.last()
                         {
                             if *top_bp >= lbp {
@@ -1199,9 +1202,8 @@ impl<
                         expect_operand = false;
                     }
                     Token::OpenParen => {
-                        // Collapse pending Dot operators (e.g. `module.function`) so the callee
-                        // on the expression stack is a ModuleMember rather than a bare MemberAccess.
-                        while initial_ops_stack_len < self.expression_operator_stack.len() {
+                        // Collapse pending Dot operators so callee is a ModuleMember.
+                        while initial_ops_len < self.expression_operator_stack.len() {
                             match self.expression_operator_stack.last() {
                                 Some((Token::Dot, _)) => self.pop_and_apply()?,
                                 _ => break,
@@ -1213,29 +1215,7 @@ impl<
                         };
 
                         self.tokenizer.advance(); // consume '('
-
-                        // Record where args start so we can index them correctly even if
-                        // the outer expression already has values on expression_stack.
                         let args_start = self.expression_stack.len();
-                        let mut nargs_on_stack = 0;
-                        let mut is_first = true;
-                        loop {
-                            if self.tokenizer.peek() == Token::CloseParen {
-                                self.tokenizer.advance();
-                                break;
-                            }
-                            if !is_first {
-                                self.consume_token(&Token::Comma)?;
-                            }
-                            let val = self.eval_expr()?;
-                            self.expression_stack
-                                .try_push(val)
-                                .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-                            nargs_on_stack += 1;
-                            is_first = false;
-                        }
-
-                        let return_addr = self.tokenizer.cursor_pos();
 
                         match function_object {
                             EngineObject::Function {
@@ -1243,18 +1223,58 @@ impl<
                                 num_args,
                                 name: _,
                             } => {
-                                // Push scope only for user-defined functions
-                                self.enter_scope(BlockScope::Function { return_addr })?;
+                                // Collect args iteratively; any arg may suspend.
+                                let mut nargs_so_far = 0;
+                                let mut is_first = true;
+                                loop {
+                                    if self.tokenizer.peek() == Token::CloseParen {
+                                        self.tokenizer.advance();
+                                        break;
+                                    }
+                                    if !is_first {
+                                        self.consume_token(&Token::Comma)?;
+                                    }
+                                    let ops_for_arg = self.expression_operator_stack.len();
+                                    match self.eval_expr_internal(ops_for_arg, true)? {
+                                        EvaluationResult::Value(v) => {
+                                            self.expression_stack
+                                                .try_push(v)
+                                                .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                                            nargs_so_far += 1;
+                                        }
+                                        EvaluationResult::Suspended => {
+                                            // Save state for continue_args to resume later.
+                                            self.arg_eval_stack
+                                                .try_push(FunctionArgState {
+                                                    function_object: EngineObject::Function {
+                                                        position,
+                                                        num_args,
+                                                        name: None,
+                                                    },
+                                                    args_start,
+                                                    outer_ops_len: initial_ops_len,
+                                                })
+                                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                                            return Ok(EvaluationResult::Suspended);
+                                        }
+                                    }
+                                    is_first = false;
+                                }
 
-                                if num_args != nargs_on_stack {
+                                // All args collected without suspension.
+                                if num_args != nargs_so_far {
                                     return Err(InterpreterError::FunctionArgsMismatch {
                                         expected: num_args,
-                                        got: nargs_on_stack,
+                                        got: nargs_so_far,
                                         name: None,
                                     });
                                 }
+                                let return_addr = self.tokenizer.cursor_pos();
+                                self.enter_scope(BlockScope::Function {
+                                    return_addr,
+                                    caller_ops_len: initial_ops_len,
+                                })?;
                                 self.tokenizer.set_cursor(position);
-
                                 for i in 0..num_args {
                                     let arg_name = match self.tokenizer.advance() {
                                         Token::Identifier(n) => n,
@@ -1276,53 +1296,65 @@ impl<
                                         self.consume_token(&Token::Comma)?;
                                     }
                                 }
-
                                 self.expression_stack.truncate(args_start);
-
                                 self.consume_token(&Token::CloseParen)?;
                                 self.consume_token(&Token::OpenBrace)?;
-
-                                let fn_scope_depth = self.scope_stack.len();
-                                loop {
-                                    match self.step() {
-                                        Ok(true) => {
-                                            if self.scope_stack.len() < fn_scope_depth {
-                                                break;
-                                            }
-                                        }
-                                        Ok(false) => break,
-                                        Err(e) => return Err(e),
-                                    }
-                                }
+                                return Ok(EvaluationResult::Suspended);
                             }
                             EngineObject::ModuleMember { module: idx, name } => {
-                                // Call module directly — no scope push needed
+                                // Module calls are synchronous — collect all args then call.
+                                let mut nargs_so_far = 0;
+                                let mut is_first = true;
+                                loop {
+                                    if self.tokenizer.peek() == Token::CloseParen {
+                                        self.tokenizer.advance();
+                                        break;
+                                    }
+                                    if !is_first {
+                                        self.consume_token(&Token::Comma)?;
+                                    }
+                                    let ops_for_arg = self.expression_operator_stack.len();
+                                    match self.eval_expr_internal(ops_for_arg, true)? {
+                                        EvaluationResult::Value(v) => {
+                                            self.expression_stack
+                                                .try_push(v)
+                                                .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                                            nargs_so_far += 1;
+                                        }
+                                        EvaluationResult::Suspended => {
+                                            self.arg_eval_stack
+                                                .try_push(FunctionArgState {
+                                                    function_object: EngineObject::ModuleMember {
+                                                        module: idx,
+                                                        name,
+                                                    },
+                                                    args_start,
+                                                    outer_ops_len: initial_ops_len,
+                                                })
+                                                .map_err(|_| InterpreterError::ScopeStackExhausted)?;
+                                            return Ok(EvaluationResult::Suspended);
+                                        }
+                                    }
+                                    is_first = false;
+                                }
                                 let result = {
-                                    let len = self.expression_stack.len();
-                                    let args = &self.expression_stack[len - nargs_on_stack..];
+                                    let args = &self.expression_stack[args_start..args_start + nargs_so_far];
                                     self.modules[idx].1.call(name, args)?
                                 };
                                 self.expression_stack.truncate(args_start);
                                 self.expression_stack
                                     .try_push(result)
                                     .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                                expect_operand = false;
                             }
                             obj => {
                                 return Err(InterpreterError::InvalidFunctionCall { obj });
                             }
                         }
-
-                        // The function result is now on expression_stack (placed by return or CloseBrace).
-                        // Signal that we have an operand so the outer expression can continue (e.g., + 1).
-                        expect_operand = false;
                     }
                     Token::CloseParen => {
-                        // Only handle this ')' if there is a matching '(' on *our* local op stack.
-                        // If there isn't one, this ')' belongs to an outer context (e.g., a
-                        // function call's argument list) — just stop evaluating and let the
-                        // caller handle it.
                         let has_matching_paren = self.expression_operator_stack
-                            [initial_ops_stack_len..]
+                            [initial_ops_len..]
                             .iter()
                             .any(|(t, _)| *t == Token::OpenParen);
 
@@ -1330,8 +1362,7 @@ impl<
                             break;
                         }
 
-                        // Execute everything back to the OpenParen
-                        while initial_ops_stack_len < self.expression_operator_stack.len()
+                        while initial_ops_len < self.expression_operator_stack.len()
                             && let Some((top_op, _)) = self.expression_operator_stack.last()
                         {
                             if *top_op == Token::OpenParen {
@@ -1349,7 +1380,7 @@ impl<
             }
         }
 
-        while initial_ops_stack_len < self.expression_operator_stack.len() {
+        while initial_ops_len < self.expression_operator_stack.len() {
             self.pop_and_apply()?;
         }
 
@@ -1358,7 +1389,196 @@ impl<
             .pop()
             .ok_or(InterpreterError::ExpressionStackEmpty)?;
 
-        self.resolve_if_member(res)
+        Ok(EvaluationResult::Value(self.resolve_if_member(res)?))
+    }
+
+    /// Called after a suspended arg's inner function has returned and its result has been
+    /// placed on the expression_stack by the resume path. Continues collecting args for the
+    /// outer function whose state is on top of `arg_eval_stack`, then sets up the call.
+    fn continue_args(
+        &mut self,
+        completed_arg: EngineObject<'a>,
+    ) -> Result<EvaluationResult<'a>, InterpreterError<'a>> {
+        let args_start = self.arg_eval_stack.last().unwrap().args_start;
+
+        // Push the just-finished arg.
+        self.expression_stack
+            .try_push(completed_arg)
+            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+
+        // Collect remaining args.
+        loop {
+            if self.tokenizer.peek() == Token::CloseParen {
+                self.tokenizer.advance();
+                break;
+            }
+            self.consume_token(&Token::Comma)?;
+            let ops_for_arg = self.expression_operator_stack.len();
+            match self.eval_expr_internal(ops_for_arg, true)? {
+                EvaluationResult::Value(v) => {
+                    self.expression_stack
+                        .try_push(v)
+                        .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                }
+                EvaluationResult::Suspended => {
+                    return Ok(EvaluationResult::Suspended);
+                }
+            }
+        }
+
+        // All args collected — set up the call.
+        let state = self.arg_eval_stack.pop().unwrap();
+        let nargs_collected = self.expression_stack.len() - args_start;
+        let return_addr = self.tokenizer.cursor_pos(); // after ')'
+        let outer_ops_len = state.outer_ops_len;
+
+        match state.function_object {
+            EngineObject::Function {
+                position,
+                num_args,
+                name: _,
+            } => {
+                if num_args != nargs_collected {
+                    return Err(InterpreterError::FunctionArgsMismatch {
+                        expected: num_args,
+                        got: nargs_collected,
+                        name: None,
+                    });
+                }
+                self.enter_scope(BlockScope::Function {
+                    return_addr,
+                    caller_ops_len: outer_ops_len,
+                })?;
+                self.tokenizer.set_cursor(position);
+                for i in 0..num_args {
+                    let arg_name = match self.tokenizer.advance() {
+                        Token::Identifier(n) => n,
+                        t => {
+                            return Err(InterpreterError::UnexpectedToken {
+                                token_pos: self.tokenizer.last_token_pos(),
+                                program: self.tokenizer.input(),
+                                expected: Token::Identifier(&[]),
+                                found: t,
+                            });
+                        }
+                    };
+                    let value = core::mem::replace(
+                        &mut self.expression_stack[args_start + i],
+                        EngineObject::Unit,
+                    );
+                    self.set_var(arg_name, value)?;
+                    if i < num_args - 1 {
+                        self.consume_token(&Token::Comma)?;
+                    }
+                }
+                self.expression_stack.truncate(args_start);
+                self.consume_token(&Token::CloseParen)?;
+                self.consume_token(&Token::OpenBrace)?;
+                Ok(EvaluationResult::Suspended)
+            }
+            EngineObject::ModuleMember { module: idx, name } => {
+                let result = {
+                    let args = &self.expression_stack[args_start..args_start + nargs_collected];
+                    self.modules[idx].1.call(name, args)?
+                };
+                self.expression_stack.truncate(args_start);
+                Ok(EvaluationResult::Value(result))
+            }
+            obj => Err(InterpreterError::InvalidFunctionCall { obj }),
+        }
+    }
+
+    /// Dispatch the result of a completed expression to the appropriate continuation.
+    /// Note: callers that resume from a function return should drain `arg_eval_stack`
+    /// themselves before calling this (see the resume path in `step()`).
+    fn handle_evaluation_result(
+        &mut self,
+        result: EvaluationResult<'a>,
+    ) -> Result<bool, InterpreterError<'a>> {
+        match result {
+            EvaluationResult::Suspended => Ok(true),
+            EvaluationResult::Value(value) => {
+                // Pop the continuation scope.
+                let Some(cont) = self.scope_stack.pop() else {
+                    return Err(InterpreterError::ScopeStackEmpty);
+                };
+                let _var_count = self
+                    .current_block_scope
+                    .pop()
+                    .ok_or(InterpreterError::ScopeStackEmpty)?;
+                // Continuation scopes always have 0 variables, so _var_count == 0.
+
+                match cont {
+                    BlockScope::Assignment { name } => {
+                        self.set_var(name, value)?;
+                        self.consume_separator()?;
+                        Ok(true)
+                    }
+                    BlockScope::ExpressionStatement => {
+                        // value is discarded
+                        self.consume_separator()?;
+                        Ok(true)
+                    }
+                    BlockScope::Return => {
+                        // Unwind scope stack to the enclosing Function scope.
+                        let mut vars_to_remove = 0;
+                        let (return_addr, caller_ops_len) = loop {
+                            let Some(scope) = self.scope_stack.pop() else {
+                                return Err(InterpreterError::ScopeStackEmpty);
+                            };
+                            vars_to_remove += self
+                                .current_block_scope
+                                .pop()
+                                .ok_or(InterpreterError::ScopeStackEmpty)?;
+                            if let BlockScope::Function {
+                                return_addr,
+                                caller_ops_len,
+                            } = scope
+                            {
+                                break (return_addr, caller_ops_len);
+                            }
+                        };
+                        self.variables.truncate(self.variables.len() - vars_to_remove);
+                        self.expression_stack
+                            .try_push(value)
+                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
+                        self.tokenizer.set_cursor(return_addr);
+                        self.resume_expression = Some(caller_ops_len);
+                        Ok(true)
+                    }
+                    BlockScope::IfCondition => {
+                        let cond = value.is_true()?;
+                        self.consume_token(&Token::OpenBrace)?;
+                        if cond {
+                            self.enter_scope(BlockScope::If)?;
+                        } else {
+                            self.skip_block(None)?;
+                            let next = self.tokenizer.peek();
+                            if next != Token::Else {
+                                self.consume_separator()?;
+                            } else {
+                                self.consume_token(&Token::Else)?;
+                                self.consume_token(&Token::OpenBrace)?;
+                                self.enter_scope(BlockScope::Else)?;
+                            }
+                        }
+                        Ok(true)
+                    }
+                    BlockScope::WhileCondition { condition_start } => {
+                        let cond = value.is_true()?;
+                        self.consume_token(&Token::OpenBrace)?;
+                        if cond {
+                            self.enter_scope(BlockScope::While { condition_start })?;
+                        } else {
+                            self.skip_block(None)?;
+                            self.consume_separator()?;
+                        }
+                        Ok(true)
+                    }
+                    _ => Err(InterpreterError::ScopeStackEmpty),
+                }
+            }
+        }
     }
 
     /// Pops one operator and the necessary number of operands, applies the operator, and pushes the result.
@@ -1515,7 +1735,7 @@ impl<
     const fn infix_binding_power(&self, token: &Token) -> Option<(u8, u8)> {
         match token {
             Token::Plus | Token::Minus => Some((2, 3)), // left bp, right bp
-            Token::Star | Token::Slash => Some((4, 5)),
+            Token::Star | Token::Slash | Token::Percent => Some((4, 5)),
             Token::Equals | Token::Lt | Token::Gt | Token::Lte | Token::Gte => Some((1, 2)),
             Token::AndAnd | Token::OrOr => Some((1, 2)),
             _ => None,
@@ -2061,7 +2281,7 @@ mod tests {
                     if n == 1 {
                         break;
                     }
-                    if n * 2 == n {
+                    if n % 2 == 0 {
                         n = n / 2;
                     } else {
                         n = 3 * n + 1;
