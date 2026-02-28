@@ -1140,6 +1140,8 @@ impl<
                     | Token::Gt
                     | Token::Lte
                     | Token::Gte
+                    | Token::AndAnd
+                    | Token::OrOr
                     | Token::Plus
                     | Token::Minus
                     | Token::Star
@@ -1463,9 +1465,15 @@ impl<
                 left = EngineObject::Bool(*l >= *r)
             }
 
-            // Compare booleans
+            // Boolean operations
             (EngineObject::Bool(l), Token::Equals, EngineObject::Bool(r)) => {
                 left = EngineObject::Bool(l == r)
+            }
+            (EngineObject::Bool(l), Token::AndAnd, EngineObject::Bool(r)) => {
+                left = EngineObject::Bool(*l && *r)
+            }
+            (EngineObject::Bool(l), Token::OrOr, EngineObject::Bool(r)) => {
+                left = EngineObject::Bool(*l || *r)
             }
 
             // Handle Dot Access
@@ -1496,6 +1504,7 @@ impl<
             Token::Plus | Token::Minus => Some((2, 3)), // left bp, right bp
             Token::Star | Token::Slash => Some((4, 5)),
             Token::Equals | Token::Lt | Token::Gt | Token::Lte | Token::Gte => Some((1, 2)),
+            Token::AndAnd | Token::OrOr => Some((1, 2)),
             _ => None,
         }
     }
@@ -2067,5 +2076,22 @@ mod tests {
             *vm.get_var(b"max_number").unwrap(),
             871.to_engine().unwrap()
         );
+    }
+
+    #[test]
+    fn test_boolean_operators() {
+        let mut vm: VmContext<'_, '_> = VmContext::new(
+            br#"
+            a = true;
+            b = false;
+            c = a && b;
+            d = a || b;
+            e = !a;
+            "#,
+        );
+        vm.run().expect("Running VM with boolean operators");
+        assert_eq!(*vm.get_var(b"c").unwrap(), false.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"d").unwrap(), true.to_engine().unwrap());
+        assert_eq!(*vm.get_var(b"e").unwrap(), false.to_engine().unwrap());
     }
 }

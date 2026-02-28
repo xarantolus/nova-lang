@@ -27,6 +27,8 @@ pub enum Token<'a> {
     Gt,     // >
     Lte,    // <=
     Gte,    // >=
+    AndAnd, // &&
+    OrOr,   // ||
 
     Plus,
     Minus, // unary or binary
