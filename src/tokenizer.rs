@@ -21,14 +21,15 @@ pub enum Token<'a> {
     Separator,
 
     // Operators
-    Assign, // =
-    Equals, // ==
-    Lt,     // <
-    Gt,     // >
-    Lte,    // <=
-    Gte,    // >=
-    AndAnd, // &&
-    OrOr,   // ||
+    Assign,    // =
+    Equals,    // ==
+    NotEquals, // !=
+    Lt,        // <
+    Gt,        // >
+    Lte,       // <=
+    Gte,       // >=
+    AndAnd,    // &&
+    OrOr,      // ||
 
     Plus,
     Minus, // unary or binary
@@ -175,7 +176,15 @@ impl<'a> Tokenizer<'a> {
                     return (Token::Separator, cursor, Some(Token::Separator));
                 }
 
-                b'!' => return (Token::Bang, cursor, Some(Token::Bang)),
+                b'!' => {
+                    // Potentially !=
+                    if cursor < input.len() && input[cursor] == b'=' {
+                        cursor += 1;
+                        return (Token::NotEquals, cursor, Some(Token::NotEquals));
+                    } else {
+                        return (Token::Bang, cursor, Some(Token::Bang));
+                    }
+                }
                 b'.' => return (Token::Dot, cursor, Some(Token::Dot)),
                 b'+' => return (Token::Plus, cursor, Some(Token::Plus)),
                 b'-' => return (Token::Minus, cursor, Some(Token::Minus)),
@@ -260,7 +269,15 @@ impl<'a> Tokenizer<'a> {
                     let mut value = (c - b'0') as i32;
                     while cursor < input.len() && input[cursor].is_ascii_digit() {
                         let digit = input[cursor] - b'0';
-                        value = value * 10 + digit as i32;
+                        value = match value
+                            .checked_mul(10)
+                            .and_then(|v| v.checked_add(digit as i32))
+                        {
+                            Some(v) => v,
+                            None => {
+                                return (Token::Error, cursor, Some(Token::Error));
+                            }
+                        };
                         cursor += 1;
                     }
                     return (

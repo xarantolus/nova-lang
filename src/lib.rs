@@ -663,9 +663,8 @@ impl<
         vm
     }
 
-    pub fn set_operations_limit(mut self, limit: usize) -> Self {
+    pub fn set_operations_limit(&mut self, limit: usize) {
         self.operations_limit = limit;
-        self
     }
 
     /// Register a module under `name`, available in scripts via `import <name>`.
@@ -1745,9 +1744,10 @@ impl<
             }
 
             // Comparison operators
-            (EngineObject::Int(l), Token::Equals, EngineObject::Int(r)) => {
-                left = EngineObject::Bool(*l == *r)
-            }
+            (l, Token::Equals, r) => left = EngineObject::Bool(*l == *r),
+            (l, Token::NotEquals, r) => left = EngineObject::Bool(*l != *r),
+
+            // Integer ops
             (EngineObject::Int(l), Token::Lt, EngineObject::Int(r)) => {
                 left = EngineObject::Bool(*l < *r)
             }
@@ -1762,9 +1762,6 @@ impl<
             }
 
             // Boolean operations
-            (EngineObject::Bool(l), Token::Equals, EngineObject::Bool(r)) => {
-                left = EngineObject::Bool(l == r)
-            }
             (EngineObject::Bool(l), Token::AndAnd, EngineObject::Bool(r)) => {
                 left = EngineObject::Bool(*l && *r)
             }
@@ -2426,5 +2423,13 @@ mod tests {
             vm.run(),
             Err(InterpreterError::ScopeStackExhausted)
         ));
+    }
+
+    #[test]
+    fn test_crash() {
+        let mut vm: VmContext<'_, '_, 16, 16> = VmContext::new(br#"6666666666&"#);
+        let result = vm.run();
+        dbg!(&result);
+        assert!(matches!(result, Err(_)));
     }
 }
