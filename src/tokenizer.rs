@@ -34,7 +34,8 @@ pub enum Token<'a> {
     Minus, // unary or binary
     Star,
     Slash,
-    Bang, // unary not
+    Percent, // Modulo operator
+    Bang,    // unary not
 
     // Data
     Identifier(&'a [u8]),
@@ -180,6 +181,7 @@ impl<'a> Tokenizer<'a> {
                 b'-' => return (Token::Minus, cursor, Some(Token::Minus)),
                 b'*' => return (Token::Star, cursor, Some(Token::Star)),
                 b'/' => return (Token::Slash, cursor, Some(Token::Slash)),
+                b'%' => return (Token::Percent, cursor, Some(Token::Percent)),
 
                 b'=' => {
                     if cursor < input.len() && input[cursor] == b'=' {
@@ -203,6 +205,22 @@ impl<'a> Tokenizer<'a> {
                         return (Token::Gte, cursor, Some(Token::Gte));
                     } else {
                         return (Token::Gt, cursor, Some(Token::Gt));
+                    }
+                }
+                b'&' => {
+                    if cursor < input.len() && input[cursor] == b'&' {
+                        cursor += 1; // Consume second '&'
+                        return (Token::AndAnd, cursor, Some(Token::AndAnd));
+                    } else {
+                        return (Token::Error, cursor, Some(Token::Error));
+                    }
+                }
+                b'|' => {
+                    if cursor < input.len() && input[cursor] == b'|' {
+                        cursor += 1; // Consume second '|'
+                        return (Token::OrOr, cursor, Some(Token::OrOr));
+                    } else {
+                        return (Token::Error, cursor, Some(Token::Error));
                     }
                 }
 

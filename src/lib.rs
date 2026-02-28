@@ -780,6 +780,7 @@ impl<
                 } else {
                     self.skip_block(None)?;
                     // cursor is now after '}'
+                    self.consume_separator()?;
                 }
             }
             (Token::Continue, _) => {
@@ -1441,6 +1442,18 @@ impl<
                 }
                 *l = l
                     .checked_div(*r)
+                    .ok_or(InterpreterError::OperatorOverflow {
+                        op,
+                        program: self.tokenizer.input(),
+                        token_pos: self.tokenizer.last_token_pos(),
+                    })?;
+            }
+            (EngineObject::Int(l), Token::Percent, EngineObject::Int(r)) => {
+                if *r == 0 {
+                    return Err(InterpreterError::DivisionByZero);
+                }
+                *l = l
+                    .checked_rem(*r)
                     .ok_or(InterpreterError::OperatorOverflow {
                         op,
                         program: self.tokenizer.input(),
