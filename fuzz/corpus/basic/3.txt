@@ -1,0 +1,33 @@
+fn fib_recursive(n) {
+	if n == 0 {
+		return 0;
+	}
+	if n == 1 {
+		return 1;
+	}
+	return fib_recursive(n-1) + fib_recursive(n-2);
+};
+
+fn fib_iterative(n) {
+	a = 0;
+	b = 1;
+	if n == 0 {
+		return a;
+	}
+	if n == 1 {
+		return b;
+	}
+	i = 2;
+	while i <= n {
+		c = a + b;
+		a = b;
+		b = c;
+		i = i + 1;
+	}
+	return b;
+};
+
+it_res = fib_iterative(10);
+rc_res = fib_recursive(10);
+
+same = it_res == rc_res;

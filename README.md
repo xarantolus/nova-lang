@@ -7,5 +7,5 @@ cargo install cargo-fuzz grcov
 
 Run fuzzing:
 ```
-cargo fuzz run  basic -- -fork=$(nproc)
+cargo fuzz run basic -- -fork=$(nproc)
 ```

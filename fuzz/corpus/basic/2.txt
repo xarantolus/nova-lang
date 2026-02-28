@@ -1,0 +1,13 @@
+fn is_even(n) {
+	if n == 0 {
+		return true;
+	} else {
+		return is_odd(n - 1);
+	}
+}
+
+fn is_odd(n) {
+	return is_even(n - 1);
+}
+
+result = is_even(5);

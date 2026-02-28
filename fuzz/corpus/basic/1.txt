@@ -1,0 +1,27 @@
+fn computeChainLength(n) {
+	steps = 0;
+	while n > 1 {
+		if n == 1 {
+			break;
+		}
+		if n % 2 == 0 {
+			n = n / 2;
+		} else {
+			n = 3 * n + 1;
+		}
+		steps = steps + 1;
+	}
+	return steps;
+}
+
+i = 1;
+max_length = 0;
+max_number = 0;
+while i < 1000 {
+	current_length = computeChainLength(i);
+	if current_length > max_length {
+		max_length = current_length;
+		max_number = i;
+	}
+	i = i + 1;
+}
