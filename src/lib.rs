@@ -1,8 +1,5 @@
 #![cfg_attr(not(test), no_std)]
 
-#[cfg(any(debug_assertions, test))]
-use core::fmt::Debug;
-
 use arrayvec::ArrayVec;
 
 use crate::tokenizer::{Token, Tokenizer};
@@ -136,7 +133,7 @@ impl PartialEq for EngineObject<'_> {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "detailed_errors"))]
 impl core::fmt::Display for EngineObject<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -180,7 +177,7 @@ impl core::fmt::Display for EngineObject<'_> {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "detailed_errors"))]
 impl core::fmt::Debug for EngineObject<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         <Self as core::fmt::Display>::fmt(self, f)
@@ -245,7 +242,7 @@ impl<'a> TryInto<bool> for EngineObject<'a> {
 }
 
 /// Errors that can occur during interpretation.
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq)]
 pub enum InterpreterError<'a> {
     /// The name provided was not found in the current variable context.
     InvalidName(&'a [u8]),
@@ -352,7 +349,7 @@ impl InterpreterError<'_> {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test, feature = "detailed_errors"))]
 impl<'a> core::fmt::Debug for InterpreterError<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -448,7 +445,7 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
 
             let line = &program[snippet_start..line_end];
             let line_number = program[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
-            let col = pos - current_line_start - 1;
+            let col = (pos - current_line_start).checked_sub(1).unwrap_or(0);
 
             write!(
                 f,
@@ -466,8 +463,6 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
     }
 }
 
-#[derive(PartialEq)]
-#[cfg_attr(any(test, debug_assertions), derive(Debug))]
 enum BlockScope {
     Normal,
     While {

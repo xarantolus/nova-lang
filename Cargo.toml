@@ -7,5 +7,9 @@ edition = "2024"
 arrayvec = {version = "0.7.6", default-features = false	}
 nova_macros = { path = "nova_macros" }
 
+[features]
+default = ["detailed_errors"]
+detailed_errors = []
+
 [dev-dependencies]
 similar-asserts = "1.7"
