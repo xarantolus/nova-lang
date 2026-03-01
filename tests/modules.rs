@@ -2,7 +2,7 @@ use nova::{InterpreterError, VmContext, engine_module, script_module};
 
 #[engine_module]
 struct MathModule {
-    CONSTANT: u32,
+    pub CONSTANT: u32,
 }
 
 #[script_module]
@@ -14,7 +14,7 @@ impl MathModule {
 
 #[engine_module]
 struct FancyMathModule {
-    MAX_INT: i32,
+    pub MAX_INT: i32,
 }
 
 #[script_module]

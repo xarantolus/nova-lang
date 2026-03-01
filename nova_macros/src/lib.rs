@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Fields, FnArg, ImplItem, ItemImpl, ItemStruct, parse_macro_input};
+use syn::{Fields, FnArg, ImplItem, ItemImpl, ItemStruct, Visibility, parse_macro_input};
 
 /// Annotation for impl blocks. It generates a ModuleCall implementation
 /// that dispatches calls to the annotated methods based on their names and argument counts.
@@ -38,6 +38,9 @@ pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream 
 
     for item in &input_impl.items {
         if let ImplItem::Fn(method) = item {
+            if !matches!(method.vis, Visibility::Public(_)) {
+                continue;
+            }
             let method_name = &method.sig.ident;
             let method_str = method_name.to_string();
             let method_bytes = syn::LitByteStr::new(method_str.as_bytes(), method_name.span());
@@ -120,6 +123,9 @@ pub fn engine_module(_args: TokenStream, input: TokenStream) -> TokenStream {
     // ItemStruct has fields directly, no need to match on Data::Struct
     if let Fields::Named(fields) = &item_struct.fields {
         for field in &fields.named {
+            if !matches!(field.vis, Visibility::Public(_)) {
+                continue;
+            }
             let field_name = field.ident.as_ref().unwrap();
             let field_str = field_name.to_string();
             let field_bytes = syn::LitByteStr::new(field_str.as_bytes(), field_name.span());
