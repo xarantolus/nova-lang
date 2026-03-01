@@ -65,8 +65,17 @@ let result: i32 = FromEngine::from_engine(variable).unwrap();
 assert_eq!(result, 42);
 ```
 
+## Installation
 
-# Fuzzing
+Add this to your `Cargo.toml` file:
+
+```toml
+nova = { git = "ssh://git@github.com/xarantolus/nova-lang.git", no-default-features = true }
+```
+
+If you want to print errors returned from the interpreter, enable the `detailed_errors` (or just remove `no-default-features = true`).
+
+## Fuzzing
 Any kind of panic is considered a bug, so we try to find things via fuzzing.
 
 You can install fuzzing tools with this command:
