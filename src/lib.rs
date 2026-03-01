@@ -1796,8 +1796,12 @@ impl<
         match token {
             Token::Plus | Token::Minus => Some((2, 3)), // left bp, right bp
             Token::Star | Token::Slash | Token::Percent => Some((4, 5)),
-            Token::Equals | Token::Lt | Token::Gt | Token::Lte | Token::Gte => Some((1, 2)),
+            Token::NotEquals | Token::Equals | Token::Lt | Token::Gt | Token::Lte | Token::Gte => {
+                Some((1, 2))
+            }
             Token::AndAnd | Token::OrOr => Some((1, 2)),
+            Token::Dot => Some((100, 101)),
+            Token::Assign => Some((0, 1)),
             _ => None,
         }
     }
