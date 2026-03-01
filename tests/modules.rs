@@ -1,7 +1,9 @@
-use nova::{InterpreterError, ToEngine, VmContext, engine_module, script_module};
+use nova::{InterpreterError, VmContext, engine_module, script_module};
 
 #[engine_module]
-struct MathModule {}
+struct MathModule {
+    CONSTANT: u32,
+}
 
 #[script_module]
 impl MathModule {
@@ -24,28 +26,41 @@ impl FancyMathModule {
 
 #[test]
 fn math_module() {
-    let mut math = MathModule {};
-    let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.add(1, 2);")
-        .add_module(b"math", &mut math)
-        .unwrap();
+    use nova::FromEngine;
+    let mut math = MathModule { CONSTANT: 41 };
+    let mut vm: VmContext<'_, '_> = VmContext::new(
+        br#"
+        import math;
+        i = math.add(1, math.CONSTANT);
+    "#,
+    )
+    .add_module(b"math", &mut math)
+    .unwrap();
     vm.run().unwrap();
-    assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
+
+    let variable = vm.get_var(b"i").unwrap();
+    let result: i32 = FromEngine::from_engine(variable).unwrap();
+    assert_eq!(result, 42);
 }
 
 #[test]
 fn math_module_fancy() {
+    use nova::FromEngine;
     let mut math = FancyMathModule { MAX_INT: 100 };
-    let mut vm: VmContext<'_, '_> =
-        VmContext::new(b"import fancy_math; i = fancy_math.MAX_INT;")
-            .add_module(b"fancy_math", &mut math)
-            .unwrap();
+    let mut vm: VmContext<'_, '_> = VmContext::new(b"import fancy_math; i = fancy_math.MAX_INT;")
+        .add_module(b"fancy_math", &mut math)
+        .unwrap();
     vm.run().unwrap();
-    assert_eq!(*vm.get_var(b"i").unwrap(), 100.to_engine().unwrap());
+
+    let variable = vm.get_var(b"i").unwrap();
+    let result: i32 = FromEngine::from_engine(variable).unwrap();
+
+    assert_eq!(result, 100);
 }
 
 #[test]
 fn invalid_function_access() {
-    let mut math = MathModule {};
+    let mut math = MathModule { CONSTANT: 42 };
     let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.subtract(1, 2);")
         .add_module(b"math", &mut math)
         .unwrap();
@@ -60,7 +75,7 @@ fn invalid_function_access() {
 
 #[test]
 fn invalid_member_access() {
-    let mut math = MathModule {};
+    let mut math = MathModule { CONSTANT: 42 };
     let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.MAX;")
         .add_module(b"math", &mut math)
         .unwrap();
@@ -73,9 +88,8 @@ fn invalid_member_access() {
 #[test]
 fn dont_set() {
     let mut math = FancyMathModule { MAX_INT: 100 };
-    let mut vm: VmContext<'_, '_> =
-        VmContext::new(b"import fancy_math; fancy_math.MAX_INT = 200;")
-            .add_module(b"fancy_math", &mut math)
-            .unwrap();
+    let mut vm: VmContext<'_, '_> = VmContext::new(b"import fancy_math; fancy_math.MAX_INT = 200;")
+        .add_module(b"fancy_math", &mut math)
+        .unwrap();
     assert!(matches!(vm.run(), Err(_)));
 }

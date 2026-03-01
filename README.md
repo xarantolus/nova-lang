@@ -1,11 +1,80 @@
-# Fuzzing
+# Nova
 
-Setup:
+Small, embeddable scripting language for Rust `no_std` programs.
+
+Features:
+- Supports ints, bools, static strings, while loops, if/else, function definitions
+- Modules allow calling Rust code from a script (with automatic generation of bindings)
+- Small binary size: <25KB without default features
+- No heap allocations (except for allocation of the `VmContext` itself)
+- The implementation limits all resources of the language (adjustable via generic parameters)
+
+### Example
+Simple fibonacci example:
+
+```rust
+let mut vm: VmContext<'_, '_> = VmContext::new(
+	br#"fn fib(n) {
+		if n <= 1 {
+			return n;
+		} else {
+			return fib(n - 1) + fib(n - 2);
+		}
+	}
+	result = fib(10);
+	"#,
+);
+vm.run().expect("Running VM with Fibonacci function");
+
+let variable = vm.get_var(b"result").unwrap();
+let result: i32 = FromEngine::from_engine(variable).unwrap();
+assert_eq!(result, 55);
+```
+
+Module example:
+
+```rust
+#[engine_module]
+struct MathModule {
+	// Read-only access to values; may be modified by functions
+	CONSTANT: u32
+}
+
+#[script_module]
+impl MathModule {
+	// All parameter and return types must implement the FromEngine/ToEngine traits
+    pub fn add(&self, a: i32, b: i32) -> i32 {
+        a + b
+    }
+}
+
+use nova::FromEngine;
+let mut math = MathModule { CONSTANT: 41 };
+let mut vm: VmContext<'_, '_> = VmContext::new(
+	br#"
+	import math;
+	i = math.add(1, math.CONSTANT);
+"#,
+)
+.add_module(b"math", &mut math)
+.unwrap();
+vm.run().unwrap();
+
+let variable = vm.get_var(b"i").unwrap();
+let result: i32 = FromEngine::from_engine(variable).unwrap();
+assert_eq!(result, 42);
+```
+
+
+# Fuzzing
+Any kind of panic is considered a bug, so we try to find things via fuzzing.
+
+You can install fuzzing tools with this command:
 ```
 cargo install cargo-fuzz grcov
 ```
 
 Run fuzzing:
 ```
-cargo fuzz run basic -- -fork=$(nproc)
+make fuzz
 ```
