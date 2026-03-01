@@ -80,23 +80,28 @@ pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream 
     TokenStream::from(quote! {
         #input_impl
 
-        impl ModuleCall for #struct_ty {
-            fn internal_call<'a>(
-                &mut self,
-                func: &'a [u8],
-                args: &[EngineObject<'a>],
-            ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-                match (func, args.len()) {
-                    #(#call_arms)*
-                    _ => Err(
-                        InterpreterError::InvalidModuleFunctionCall {
-                            func,
-                            nargs: args.len(),
-                        }
-                    ),
+        #[allow(unused_qualifications)]
+        const _: () = {
+            use ::nova::__private::{EngineObject, FromEngine, InterpreterError, ModuleCall, ToEngine};
+
+            impl ModuleCall for #struct_ty {
+                fn internal_call<'a>(
+                    &mut self,
+                    func: &'a [u8],
+                    args: &[EngineObject<'a>],
+                ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+                    match (func, args.len()) {
+                        #(#call_arms)*
+                        _ => Err(
+                            InterpreterError::InvalidModuleFunctionCall {
+                                func,
+                                nargs: args.len(),
+                            }
+                        ),
+                    }
                 }
             }
-        }
+        };
     })
 }
 
@@ -129,16 +134,21 @@ pub fn engine_module(_args: TokenStream, input: TokenStream) -> TokenStream {
         #[allow(non_snake_case)]
         #item_struct
 
-        impl ModuleGet for #name {
-            fn internal_get<'a>(
-                &self,
-                member: &'a [u8],
-            ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-                match member {
-                    #(#get_arms)*
-                    _ => Err(InterpreterError::InvalidModuleMemberAccess { member }),
+        #[allow(unused_qualifications)]
+        const _: () = {
+            use ::nova::__private::{EngineObject, InterpreterError, ModuleGet, ToEngine};
+
+            impl ModuleGet for #name {
+                fn internal_get<'a>(
+                    &self,
+                    member: &'a [u8],
+                ) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+                    match member {
+                        #(#get_arms)*
+                        _ => Err(InterpreterError::InvalidModuleMemberAccess { member }),
+                    }
                 }
             }
-        }
+        };
     })
 }

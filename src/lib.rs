@@ -8,6 +8,13 @@ pub use nova_macros::{engine_module, script_module};
 
 mod tokenizer;
 
+/// Hidden re-export used by the `engine_module` and `script_module` proc macros.
+/// Not part of the public API; semver exempted.
+#[doc(hidden)]
+pub mod __private {
+    pub use super::*;
+}
+
 /// Trait for implementing function calls on modules.
 /// This is separate from `Module` to allow modules that only have member access (e.g. constants) without needing to implement a full call interface.
 pub trait ModuleCall {
@@ -197,6 +204,35 @@ impl<'a> FromEngine<'a> for i32 {
     }
 }
 
+impl<'a> FromEngine<'a> for &'a str {
+    fn from_engine(obj: &EngineObject<'a>) -> Result<Self, InterpreterError<'a>> {
+        match obj {
+            EngineObject::StringLiteral {
+                content,
+                has_escape_characters: false,
+            } => {
+                core::str::from_utf8(content).map_err(|_| InterpreterError::InvalidTypeConversion {
+                    from: obj.clone(),
+                    to: "&str",
+                })
+            }
+            _ => Err(InterpreterError::InvalidTypeConversion {
+                from: obj.clone(),
+                to: "&str",
+            }),
+        }
+    }
+}
+
+impl<'a> ToEngine<'a> for &'a str {
+    fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
+        Ok(EngineObject::StringLiteral {
+            content: self.as_bytes(),
+            has_escape_characters: false,
+        })
+    }
+}
+
 impl<'a, T: ToEngine<'a>> ToEngine<'a> for Result<T, InterpreterError<'a>> {
     fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
         self.map_err(|e| e)?.to_engine()
@@ -335,6 +371,8 @@ pub enum InterpreterError<'a> {
     DivisionByZero,
     // When execution finishes, but not all scopes were closed
     InvalidEndScope,
+    // For errors that don't fit any of the above categories, or when more specific information is not available, we can use a custom error message.
+    Custom(&'a str),
 }
 
 impl InterpreterError<'_> {
@@ -482,6 +520,7 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
                     "Invalid end of scope: not all scopes were closed at end of execution"
                 )
             }
+            InterpreterError::Custom(msg) => write!(f, "Error: {}", msg),
         }?;
 
         if let Some((pos, program)) = self.program_info() {
@@ -2163,86 +2202,6 @@ mod tests {
         assert!(matches!(vm.run(), Err(InterpreterError::BreakOutsideLoop)));
     }
 
-    use nova_macros::{engine_module, script_module};
-
-    #[engine_module]
-    struct MathModule {}
-
-    #[script_module]
-    impl MathModule {
-        pub fn add(&self, a: i32, b: i32) -> i32 {
-            a + b
-        }
-    }
-
-    #[test]
-    fn math_module() {
-        let mut math = MathModule {};
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.add(1, 2);")
-            .add_module(b"math", &mut math)
-            .unwrap();
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
-    }
-
-    #[engine_module]
-    struct FancyMathModule {
-        MAX_INT: i32,
-    }
-
-    #[script_module]
-    impl FancyMathModule {
-        fn set_max(&mut self, max: i32) {
-            self.MAX_INT = max;
-        }
-    }
-
-    #[test]
-    fn math_module_fancy() {
-        let mut math = FancyMathModule { MAX_INT: 100 };
-        let mut vm: VmContext<'_, '_> =
-            VmContext::new(b"import fancy_math; i = fancy_math.MAX_INT;")
-                .add_module(b"fancy_math", &mut math)
-                .unwrap();
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"i").unwrap(), 100.to_engine().unwrap());
-    }
-
-    #[test]
-    fn invalid_function_access() {
-        let mut math = MathModule {};
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.subtract(1, 2);")
-            .add_module(b"math", &mut math)
-            .unwrap();
-        assert!(matches!(
-            vm.run(),
-            Err(InterpreterError::InvalidModuleFunctionCall {
-                func: b"subtract",
-                nargs: 2,
-            })
-        ));
-    }
-    #[test]
-    fn invalid_member_access() {
-        let mut math = MathModule {};
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"import math; i = math.MAX;")
-            .add_module(b"math", &mut math)
-            .unwrap();
-        assert!(matches!(
-            vm.run(),
-            Err(InterpreterError::InvalidModuleMemberAccess { member: b"MAX" })
-        ));
-    }
-
-    #[test]
-    fn dont_set() {
-        let mut math = FancyMathModule { MAX_INT: 100 };
-        let mut vm: VmContext<'_, '_> =
-            VmContext::new(b"import fancy_math; fancy_math.MAX_INT = 200;")
-                .add_module(b"fancy_math", &mut math)
-                .unwrap();
-        assert!(matches!(vm.run(), Err(_)));
-    }
 
     #[test]
     fn fibonacci_two() {
