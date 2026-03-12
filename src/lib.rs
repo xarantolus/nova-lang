@@ -1,3 +1,53 @@
+//! Nova is a simple, embedded scripting engine for Rust.
+//!
+//! Scripts support variables, arithmetic, comparisons, if/else, while loops,
+//! user-defined functions, and native modules. All allocations are bounded at
+//! compile time via const generic parameters, making the engine suitable for
+//! `no_std` environments.
+//!
+//! # Quick start
+//!
+//! ```rust
+//! use nova::{VmContext, EngineObject};
+//!
+//! let mut vm: VmContext<'_> = VmContext::new();
+//! let result = vm.run(b"x = 6 * 7;").unwrap();
+//! assert_eq!(result.get_var(b"x"), Some(&EngineObject::Int(42)));
+//! ```
+//!
+//! The same [`VmContext`] can run multiple independent scripts without
+//! reallocation:
+//!
+//! ```rust
+//! use nova::{VmContext, EngineObject};
+//!
+//! let mut vm: VmContext<'_> = VmContext::new();
+//! let r1 = vm.run(b"x = 1;").unwrap();
+//! let r2 = vm.run(b"x = 2;").unwrap();
+//! assert_eq!(r1.get_var(b"x"), Some(&EngineObject::Int(1)));
+//! assert_eq!(r2.get_var(b"x"), Some(&EngineObject::Int(2)));
+//! ```
+//!
+//! # Modules
+//!
+//! Native Rust functionality can be exposed to scripts via the [`engine_module`]
+//! and [`script_module`] proc macros — see their documentation for details.
+//!
+//! # Limiting execution
+//!
+//! To guard against runaway scripts, set an operations cap before running:
+//!
+//! ```rust
+//! use nova::{VmContext, InterpreterError};
+//!
+//! let mut vm: VmContext<'_> = VmContext::new();
+//! vm.set_operations_limit(1_000);
+//! assert!(matches!(
+//!     vm.run(b"i = 0; while true { i = i + 1; }"),
+//!     Err(InterpreterError::TooManyOperations),
+//! ));
+//! ```
+
 #![cfg_attr(not(test), no_std)]
 
 use arrayvec::ArrayVec;
@@ -91,7 +141,6 @@ pub enum EngineObject<'a> {
         // Position of the function in the script, at the opening brace of arguments. We can jump to it to call it.
         position: usize,
         num_args: usize,
-        name: Option<&'a [u8]>,
     },
     // A simple integer value.
     Int(i32),
@@ -158,19 +207,8 @@ impl core::fmt::Display for EngineObject<'_> {
                 "<module_member:{}>",
                 core::str::from_utf8(name).unwrap_or("<invalid utf-8>")
             ),
-            EngineObject::Function {
-                position,
-                num_args,
-                name,
-            } => {
-                write!(
-                    f,
-                    "<function:{}({})@{}>",
-                    name.map_or("<anonymous>", |n| core::str::from_utf8(n)
-                        .unwrap_or("<invalid utf-8>")),
-                    num_args,
-                    position
-                )
+            EngineObject::Function { position, num_args } => {
+                write!(f, "<function({})@{}>", num_args, position)
             }
             EngineObject::Handle { id, .. } => write!(f, "<handle@{}>", id),
             EngineObject::Unit => write!(f, "void"),
@@ -621,7 +659,58 @@ struct Variable<'a> {
     value: EngineObject<'a>,
 }
 
-/// The virtual machine context, holding all state needed for execution.
+/// Result of a successful script run, containing the global variables from the executed script.
+pub struct RunResult<'a, const STACK_SIZE: usize = 32> {
+    variables: ArrayVec<Variable<'a>, STACK_SIZE>,
+}
+
+impl<'a, const STACK_SIZE: usize> RunResult<'a, STACK_SIZE> {
+    /// Get a global variable by name, returning a reference to its value.
+    ///
+    /// Returns `None` if no variable with that name exists in the global scope.
+    ///
+    /// ```rust
+    /// use nova::{VmContext, EngineObject};
+    ///
+    /// let mut vm: VmContext<'_> = VmContext::new();
+    /// let result = vm.run(b"answer = 42;").unwrap();
+    ///
+    /// assert_eq!(result.get_var(b"answer"), Some(&EngineObject::Int(42)));
+    /// assert_eq!(result.get_var(b"missing"), None);
+    /// ```
+    pub fn get_var(&self, name: &[u8]) -> Option<&EngineObject<'a>> {
+        self.variables
+            .iter()
+            .rev()
+            .find(|v| v.name == name)
+            .map(|v| &v.value)
+    }
+}
+
+/// Per-run execution state. Created fresh on each call to [`VmContext::run`].
+struct Execution<
+    'a,
+    'vm,
+    'm,
+    const STACK_SIZE: usize,
+    const MAX_SCOPE_DEPTH: usize,
+    const MAX_EXPRESSION_DEPTH: usize,
+    const MAX_MODULES: usize,
+> {
+    variables: ArrayVec<Variable<'a>, STACK_SIZE>,
+    scope_stack: ArrayVec<BlockScope<'a>, MAX_SCOPE_DEPTH>,
+    current_block_scope: ArrayVec<usize, MAX_SCOPE_DEPTH>,
+    expression_stack: ArrayVec<EngineObject<'a>, MAX_EXPRESSION_DEPTH>,
+    expression_operator_stack: ArrayVec<(Token<'a>, u8), MAX_EXPRESSION_DEPTH>,
+    resume_expression: Option<usize>,
+    arg_eval_stack: ArrayVec<FunctionArgState<'a>, MAX_SCOPE_DEPTH>,
+    tokenizer: Tokenizer<'a>,
+    modules: &'vm mut ArrayVec<(&'m [u8], &'m mut dyn Module), MAX_MODULES>,
+    operations_limit: usize,
+    current_operations: usize,
+}
+
+/// The virtual machine context, holding all persistent state between script runs.
 ///
 /// The generic parameters specify various limits for the VM, to allow tuning for different environments and use cases.
 /// - `STACK_SIZE`: maximum number of variables that can be in scope at once.
@@ -629,96 +718,53 @@ struct Variable<'a> {
 /// - `MAX_EXPRESSION_DEPTH`: maximum depth of nested expressions
 /// - `MAX_MODULES`: maximum number of modules that can be registered and imported.
 pub struct VmContext<
-    'a,
     'm,
     const STACK_SIZE: usize = 32,
     const MAX_SCOPE_DEPTH: usize = 32,
     const MAX_EXPRESSION_DEPTH: usize = 16,
     const MAX_MODULES: usize = 4,
 > {
-    // variables[0..current_block_scope[0]] == global context.
-    variables: ArrayVec<Variable<'a>, STACK_SIZE>,
-
-    // We keep track of block/loop/function frames.
-    scope_stack: ArrayVec<BlockScope<'a>, MAX_SCOPE_DEPTH>,
-    current_block_scope: ArrayVec<usize, MAX_SCOPE_DEPTH>,
-
     modules: ArrayVec<(&'m [u8], &'m mut dyn Module), MAX_MODULES>,
-
-    // Expression evaluation stacks
-    expression_stack: ArrayVec<EngineObject<'a>, MAX_EXPRESSION_DEPTH>,
-    expression_operator_stack: ArrayVec<(Token<'a>, u8), MAX_EXPRESSION_DEPTH>,
-
     operations_limit: usize,
-    current_operations: usize,
-
-    tokenizer: Tokenizer<'a>,
-    // TODO: maybe a "scratch space" for e.g. string concatenation / unescapes, so we don't need to allocate for them
-    /// If Some, the VM is currently resuming an expression after a function return.
-    /// The value is the `initial_ops_stack_len` to pass to the expression parser.
-    resume_expression: Option<usize>,
-    /// Stack of suspended function-argument-collection states.
-    /// Pushed when eval_expr_internal suspends mid-arg-list; popped in continue_args.
-    arg_eval_stack: ArrayVec<FunctionArgState<'a>, MAX_SCOPE_DEPTH>,
 }
+
+/// A [`VmContext`] configuration that uses at most **1 KB** of stack per [`run`](VmContext::run).
+///
+/// Limits: 4 variables, 4 scope levels, 4 expression depth, 2 modules.
+pub type VmContextTiny<'m> = VmContext<'m, 4, 4, 4, 2>;
+
+/// A [`VmContext`] configuration that uses at most **2 KB** of stack per [`run`](VmContext::run).
+///
+/// Limits: 8 variables, 8 scope levels, 8 expression depth, 2 modules.
+pub type VmContextSmall<'m> = VmContext<'m, 8, 8, 8, 2>;
+
+/// A [`VmContext`] configuration that uses at most **4 KB** of stack per [`run`](VmContext::run).
+///
+/// Limits: 16 variables, 16 scope levels, 16 expression depth, 4 modules.
+pub type VmContextMedium<'m> = VmContext<'m, 16, 16, 16, 4>;
+
+/// The default [`VmContext`] configuration, using at most **8 KB** of stack per [`run`](VmContext::run).
+///
+/// Limits: 32 variables, 32 scope levels, 16 expression depth, 4 modules.
+pub type VmContextLarge<'m> = VmContext<'m, 32, 32, 16, 4>;
 
 impl<
     'a,
+    'vm,
     'm,
     const STACK_SIZE: usize,
     const MAX_SCOPE_DEPTH: usize,
     const MAX_EXPRESSION_DEPTH: usize,
     const MAX_MODULES: usize,
-> VmContext<'a, 'm, STACK_SIZE, MAX_SCOPE_DEPTH, MAX_EXPRESSION_DEPTH, MAX_MODULES>
+> Execution<'a, 'vm, 'm, STACK_SIZE, MAX_SCOPE_DEPTH, MAX_EXPRESSION_DEPTH, MAX_MODULES>
 {
-    const _ASSERT_STACK_SIZE: () = assert!(STACK_SIZE > 0, "STACK_SIZE must be greater than 0");
-    const _ASSERT_MAX_SCOPE_DEPTH: () = assert!(
-        MAX_SCOPE_DEPTH > 0,
-        "MAX_SCOPE_DEPTH must be greater than 0"
-    );
-
-    /// Create a new VM context with the given script as input.
-    pub fn new(script: &'a [u8]) -> Self {
-        let mut vm = Self {
-            variables: ArrayVec::new_const(),
-            scope_stack: ArrayVec::new_const(),
-            current_block_scope: ArrayVec::new_const(),
-            tokenizer: Tokenizer::new(script),
-            expression_operator_stack: ArrayVec::new_const(),
-            expression_stack: ArrayVec::new_const(),
-            modules: ArrayVec::new_const(),
-            operations_limit: usize::MAX,
-            current_operations: 0,
-            resume_expression: None,
-            arg_eval_stack: ArrayVec::new_const(),
-        };
-        // global context starts with 0 objects
-        unsafe {
-            // SAFETY: works since MAX_SCOPE_DEPTH > 0, asserted above
-            // We use BlockScope::Normal to represent the global scope
-            vm.scope_stack.push_unchecked(BlockScope::Normal);
-            vm.current_block_scope.push_unchecked(0);
+    fn into_result(self) -> RunResult<'a, STACK_SIZE> {
+        RunResult {
+            variables: self.variables,
         }
-        vm
     }
 
-    pub fn set_operations_limit(&mut self, limit: usize) {
-        self.operations_limit = limit;
-    }
-
-    /// Register a module under `name`, available in scripts via `import <name>`.
-    pub fn add_module(
-        mut self,
-        name: &'m [u8],
-        m: &'m mut dyn Module,
-    ) -> Result<Self, InterpreterError<'a>> {
-        self.modules
-            .try_push((name, m))
-            .map_err(|_| InterpreterError::TooManyModules)?;
-        Ok(self)
-    }
-
-    pub fn run(&mut self) -> Result<(), InterpreterError<'a>> {
+    fn run_loop(&mut self) -> Result<(), InterpreterError<'a>> {
         loop {
             match self.step() {
                 Err(e) => return Err(e),
@@ -742,7 +788,7 @@ impl<
     }
 
     // Returns: Ok(true) if work was done, Ok(false) if EOF, Err on error
-    pub fn step(&mut self) -> Result<bool, InterpreterError<'a>> {
+    fn step(&mut self) -> Result<bool, InterpreterError<'a>> {
         self.check_operations_limit()?;
 
         if let Some(ops_len) = self.resume_expression {
@@ -853,7 +899,6 @@ impl<
                     EngineObject::Function {
                         position: function_pos,
                         num_args: nargs,
-                        name: Some(function_name),
                     },
                 )?;
             }
@@ -1050,7 +1095,7 @@ impl<
     /// Set a variable in current or global scope.
     /// If the variable is already defined in the current scope, or the global scope (not: parent scopes!),
     /// it is updated. Otherwise, a new variable is created in the current scope.
-    pub fn set_var(
+    fn set_var(
         &mut self,
         name: &'a [u8],
         value: EngineObject<'a>,
@@ -1112,7 +1157,7 @@ impl<
         Ok(())
     }
 
-    pub fn get_var(&mut self, name: &'a [u8]) -> Result<&EngineObject<'a>, InterpreterError<'a>> {
+    fn get_var(&mut self, name: &'a [u8]) -> Result<&EngineObject<'a>, InterpreterError<'a>> {
         let mut current_stack_index = self.variables.len();
 
         // Look in current function stack first
@@ -1314,11 +1359,7 @@ impl<
                         let args_start = self.expression_stack.len();
 
                         match function_object {
-                            EngineObject::Function {
-                                position,
-                                num_args,
-                                name: _,
-                            } => {
+                            EngineObject::Function { position, num_args } => {
                                 // Collect args iteratively; any arg may suspend.
                                 let mut nargs_so_far = 0;
                                 let mut is_first = true;
@@ -1345,7 +1386,6 @@ impl<
                                                     function_object: EngineObject::Function {
                                                         position,
                                                         num_args,
-                                                        name: None,
                                                     },
                                                     args_start,
                                                     outer_ops_len: initial_ops_len,
@@ -1533,11 +1573,7 @@ impl<
         let outer_ops_len = state.outer_ops_len;
 
         match state.function_object {
-            EngineObject::Function {
-                position,
-                num_args,
-                name: _,
-            } => {
+            EngineObject::Function { position, num_args } => {
                 if num_args != nargs_collected {
                     return Err(InterpreterError::FunctionArgsMismatch {
                         expected: num_args,
@@ -1860,6 +1896,172 @@ impl<
     }
 }
 
+impl<
+    'm,
+    const STACK_SIZE: usize,
+    const MAX_SCOPE_DEPTH: usize,
+    const MAX_EXPRESSION_DEPTH: usize,
+    const MAX_MODULES: usize,
+> VmContext<'m, STACK_SIZE, MAX_SCOPE_DEPTH, MAX_EXPRESSION_DEPTH, MAX_MODULES>
+{
+    const _ASSERT_STACK_SIZE: () = assert!(STACK_SIZE > 0, "STACK_SIZE must be greater than 0");
+    const _ASSERT_MAX_SCOPE_DEPTH: () = assert!(
+        MAX_SCOPE_DEPTH > 0,
+        "MAX_SCOPE_DEPTH must be greater than 0"
+    );
+
+    /// Create a new VM context with no modules registered and no operations limit.
+    ///
+    /// ```rust
+    /// use nova::{VmContext, EngineObject};
+    ///
+    /// let mut vm: VmContext<'_> = VmContext::new();
+    /// let result = vm.run(b"n = 1 + 1;").unwrap();
+    /// assert_eq!(result.get_var(b"n"), Some(&EngineObject::Int(2)));
+    /// ```
+    pub const fn new() -> Self {
+        Self {
+            modules: ArrayVec::new_const(),
+            operations_limit: usize::MAX,
+        }
+    }
+
+    /// Limit the total number of operations a single [`run`](Self::run) call may perform.
+    ///
+    /// This is the primary way to protect against infinite loops or runaway scripts.
+    /// Each token evaluation counts as one operation.
+    ///
+    /// ```rust
+    /// use nova::{VmContext, InterpreterError};
+    ///
+    /// let mut vm: VmContext<'_> = VmContext::new();
+    /// vm.set_operations_limit(500);
+    /// assert!(matches!(
+    ///     vm.run(b"i = 0; while true { i = i + 1; }"),
+    ///     Err(InterpreterError::TooManyOperations),
+    /// ));
+    /// ```
+    pub fn set_operations_limit(&mut self, limit: usize) {
+        self.operations_limit = limit;
+    }
+
+    /// Register a module under `name`, available in scripts via `import <name>`.
+    ///
+    /// Uses a builder pattern so modules can be chained before the first [`run`](Self::run).
+    ///
+    /// Returns [`InterpreterError::TooManyModules`] if `MAX_MODULES` is already reached.
+    ///
+    /// ```rust
+    /// use nova::{VmContext, engine_module, script_module, FromEngine};
+    ///
+    /// #[engine_module]
+    /// struct Calc;
+    ///
+    /// #[script_module]
+    /// impl Calc {
+    ///     pub fn double(&self, x: i32) -> i32 { x * 2 }
+    /// }
+    ///
+    /// let mut calc = Calc {};
+    /// let mut vm: VmContext<'_> = VmContext::new().add_module(b"calc", &mut calc).unwrap();
+    /// let result = vm.run(b"import calc; y = calc.double(21);").unwrap();
+    /// let y: i32 = FromEngine::from_engine(result.get_var(b"y").unwrap()).unwrap();
+    /// assert_eq!(y, 42);
+    /// ```
+    pub fn add_module(
+        mut self,
+        name: &'m [u8],
+        m: &'m mut dyn Module,
+    ) -> Result<Self, InterpreterError<'static>> {
+        self.modules
+            .try_push((name, m))
+            .map_err(|_| InterpreterError::TooManyModules)?;
+        Ok(self)
+    }
+
+    /// Execute `script`, returning a [`RunResult`] for inspecting global variables.
+    ///
+    /// The same `VmContext` can be reused across multiple calls; registered modules
+    /// and the operations limit persist, but all script state (variables, call stack)
+    /// is discarded between runs.
+    ///
+    /// ```rust
+    /// use nova::{VmContext, EngineObject};
+    ///
+    /// let mut vm: VmContext<'_> = VmContext::new();
+    ///
+    /// // First run — defines and calls a function
+    /// let r = vm.run(br#"
+    ///     fn fib(n) {
+    ///         if n <= 1 { return n; }
+    ///         return fib(n - 1) + fib(n - 2);
+    ///     }
+    ///     result = fib(10);
+    /// "#).unwrap();
+    /// assert_eq!(r.get_var(b"result"), Some(&EngineObject::Int(55)));
+    ///
+    /// // Second run with a different script — previous variables are gone
+    /// let r2 = vm.run(b"x = 99;").unwrap();
+    /// assert_eq!(r2.get_var(b"result"), None);
+    /// assert_eq!(r2.get_var(b"x"), Some(&EngineObject::Int(99)));
+    /// ```
+    pub fn run<'a>(
+        &mut self,
+        script: &'a [u8],
+    ) -> Result<RunResult<'a, STACK_SIZE>, InterpreterError<'a>> {
+        let mut exec: Execution<
+            'a,
+            '_,
+            'm,
+            STACK_SIZE,
+            MAX_SCOPE_DEPTH,
+            MAX_EXPRESSION_DEPTH,
+            MAX_MODULES,
+        > = Execution {
+            variables: ArrayVec::new_const(),
+            scope_stack: ArrayVec::new_const(),
+            current_block_scope: ArrayVec::new_const(),
+            expression_stack: ArrayVec::new_const(),
+            expression_operator_stack: ArrayVec::new_const(),
+            resume_expression: None,
+            arg_eval_stack: ArrayVec::new_const(),
+            tokenizer: Tokenizer::new(script),
+            modules: &mut self.modules,
+            operations_limit: self.operations_limit,
+            current_operations: 0,
+        };
+        // global context starts with 0 objects
+        unsafe {
+            // SAFETY: works since MAX_SCOPE_DEPTH > 0, asserted above
+            // We use BlockScope::Normal to represent the global scope
+            exec.scope_stack.push_unchecked(BlockScope::Normal);
+            exec.current_block_scope.push_unchecked(0);
+        }
+        exec.run_loop()?;
+        Ok(exec.into_result())
+    }
+}
+
+// Stack-frame size guarantees for the four predefined tiers.
+// Each assertion verifies that a single `run()` call allocates at most the
+// advertised amount for the `Execution` state (VmContext itself is much smaller).
+const _: () = assert!(
+    core::mem::size_of::<Execution<'static, 'static, 'static, 4, 4, 4, 2>>() <= 1024,
+    "VmContextTiny Execution must fit in 1 KB"
+);
+const _: () = assert!(
+    core::mem::size_of::<Execution<'static, 'static, 'static, 8, 8, 8, 2>>() <= 2048,
+    "VmContextSmall Execution must fit in 2 KB"
+);
+const _: () = assert!(
+    core::mem::size_of::<Execution<'static, 'static, 'static, 16, 16, 16, 4>>() <= 4096,
+    "VmContextMedium Execution must fit in 4 KB"
+);
+const _: () = assert!(
+    core::mem::size_of::<Execution<'static, 'static, 'static, 32, 32, 16, 4>>() <= 8192,
+    "VmContextLarge Execution must fit in 8 KB"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,11 +2069,10 @@ mod tests {
     use similar_asserts::assert_eq;
 
     fn assert_expr(input: &[u8], expected: EngineObject) {
-        let code = Box::leak(Box::new([b"result = ", input].concat()));
-        let mut vm: VmContext<'_, '_> = VmContext::new(&code);
-        vm.run().unwrap();
-        let actual = vm.get_var(b"result").unwrap();
-        assert_eq!(actual, &expected);
+        let code = [b"result = ".as_slice(), input].concat();
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(&code).unwrap();
+        assert_eq!(result.get_var(b"result").unwrap(), &expected);
     }
 
     #[test]
@@ -1933,65 +2134,65 @@ mod tests {
 
     #[test]
     fn assign_variables() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"a = 5 + 5;");
-        assert!(vm.run().is_ok());
-        assert_eq!(*vm.get_var(b"a").unwrap(), 10.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(b"a = 5 + 5;").unwrap();
+        assert_eq!(*result.get_var(b"a").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn assign_multiple_variables() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"a = 5 + 5; b = a + 5;");
-        assert!(vm.run().is_ok());
-        assert_eq!(*vm.get_var(b"a").unwrap(), 10.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"b").unwrap(), 15.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(b"a = 5 + 5; b = a + 5;").unwrap();
+        assert_eq!(*result.get_var(b"a").unwrap(), 10.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"b").unwrap(), 15.to_engine().unwrap());
     }
 
     #[test]
     fn assign_too_many_variables() {
         // Limit stack to at most 2 variables
-        let mut vm: VmContext<'_, '_, 2, 16, 8, 16> =
-            VmContext::new(b"a = 5 + 5; b = a + 5; c = b + a;");
+        let mut vm: VmContext<'_, 2, 16, 8, 16> = VmContext::new();
         assert!(matches!(
-            vm.run(),
+            vm.run(b"a = 5 + 5; b = a + 5; c = b + a;"),
             Err(InterpreterError::VariableStackOverflow)
         ));
     }
 
     #[test]
     fn declare_function() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"fn test(a, b) { return a + b }
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"fn test(a, b) { return a + b }
             fn test2() { return 7 }
         "#,
-        );
-        vm.run().expect("Running VM to declare function");
-        {
-            let test_func = vm.get_var(b"test").expect("function to be variable");
-            assert!(matches!(
-                test_func,
-                EngineObject::Function {
-                    position: 8,
-                    num_args: 2,
-                    name: Some(b"test")
-                }
-            ));
-        }
+            )
+            .expect("Running VM to declare function");
 
-        let test_func2 = vm.get_var(b"test2").expect("function to be variable");
+        let test_func = result.get_var(b"test").expect("function to be variable");
+        assert!(matches!(
+            test_func,
+            EngineObject::Function {
+                position: 8,
+                num_args: 2,
+            }
+        ));
+
+        let test_func2 = result.get_var(b"test2").expect("function to be variable");
         assert!(matches!(
             test_func2,
             EngineObject::Function {
                 position: 52,
                 num_args: 0,
-                name: Some(b"test2")
             }
         ));
     }
 
     #[test]
     fn if_else() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"a = 5;
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"a = 5;
             b = 0;
             if a > 3 {
                 b = 10;
@@ -1999,29 +2200,33 @@ mod tests {
                 b = 20;
             }
         "#,
-        );
-        vm.run().expect("Running VM with if-else");
-        assert_eq!(*vm.get_var(b"b").unwrap(), 10.to_engine().unwrap());
+            )
+            .expect("Running VM with if-else");
+        assert_eq!(*result.get_var(b"b").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn if_only() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"a = 5;
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"a = 5;
             b = 0;
             if a > 3 {
                 b = 10;
             }
         "#,
-        );
-        vm.run().expect("Running VM with if-else");
-        assert_eq!(*vm.get_var(b"b").unwrap(), 10.to_engine().unwrap());
+            )
+            .expect("Running VM with if-else");
+        assert_eq!(*result.get_var(b"b").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn if_nested() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"a = 5;
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"a = 5;
             b = 0;
             if a > 3 {
                 if (a < 10) {
@@ -2029,39 +2234,43 @@ mod tests {
                 }
             }
         "#,
-        );
-        vm.run().expect("Running VM with if-else");
-        assert_eq!(*vm.get_var(b"b").unwrap(), 10.to_engine().unwrap());
+            )
+            .expect("Running VM with if-else");
+        assert_eq!(*result.get_var(b"b").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn function_call() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"fn val() { return 5; }
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"fn val() { return 5; }
                 c = val();
             "#,
-        );
-        vm.run().expect("Running VM with function call");
-        assert_eq!(*vm.get_var(b"c").unwrap(), 5.to_engine().unwrap());
+            )
+            .expect("Running VM with function call");
+        assert_eq!(*result.get_var(b"c").unwrap(), 5.to_engine().unwrap());
     }
 
     #[test]
     fn stack_overflow() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"fn recurse() { return recurse(); }
+        let mut vm: VmContext<'_> = VmContext::new();
+        assert!(matches!(
+            vm.run(
+                br#"fn recurse() { return recurse(); }
                 recurse();
             "#,
-        );
-        assert!(matches!(
-            vm.run(),
+            ),
             Err(InterpreterError::ScopeStackExhausted)
         ));
     }
 
     #[test]
     fn fibonacci() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"fn fib(n) {
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"fn fib(n) {
                 if n <= 1 {
                     return n;
                 } else {
@@ -2070,67 +2279,72 @@ mod tests {
             }
             result = fib(10);
             "#,
-        );
-        vm.run().expect("Running VM with Fibonacci function");
-        assert_eq!(*vm.get_var(b"result").unwrap(), 55.to_engine().unwrap());
+            )
+            .expect("Running VM with Fibonacci function");
+        assert_eq!(*result.get_var(b"result").unwrap(), 55.to_engine().unwrap());
     }
 
     #[test]
     fn function_call_two_args() {
-        let mut vm: VmContext<'_, '_> =
-            VmContext::new(b"fn add(a, b) { return a + b; }\nresult = add(2, 3);");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), 5.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(b"fn add(a, b) { return a + b; }\nresult = add(2, 3);")
+            .unwrap();
+        assert_eq!(*result.get_var(b"result").unwrap(), 5.to_engine().unwrap());
     }
 
     #[test]
     fn function_call_implicit_unit() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"fn noop() {}\nresult = noop();");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), EngineObject::Unit);
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(b"fn noop() {}\nresult = noop();").unwrap();
+        assert_eq!(*result.get_var(b"result").unwrap(), EngineObject::Unit);
     }
 
     #[test]
     fn function_call_in_expression() {
-        let mut vm: VmContext<'_, '_> =
-            VmContext::new(b"fn add(a, b) { return a + b; }\nresult = add(2, 3) + 1;");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), 6.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(b"fn add(a, b) { return a + b; }\nresult = add(2, 3) + 1;")
+            .unwrap();
+        assert_eq!(*result.get_var(b"result").unwrap(), 6.to_engine().unwrap());
     }
 
     #[test]
     fn nested_function_call_as_arg() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"fn double(x) { return x * 2; }\nfn add(a, b) { return a + b; }\nresult = add(double(2), 3);");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"result").unwrap(), 7.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(b"fn double(x) { return x * 2; }\nfn add(a, b) { return a + b; }\nresult = add(double(2), 3);").unwrap();
+        assert_eq!(*result.get_var(b"result").unwrap(), 7.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_basic() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"i = 0;\nwhile i < 3 {\ni = i + 1;\n}");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"i").unwrap(), 3.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(b"i = 0;\nwhile i < 3 {\ni = i + 1;\n}").unwrap();
+        assert_eq!(*result.get_var(b"i").unwrap(), 3.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_never_executes() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"i = 5;\nwhile i < 3 {\ni = i + 1;\n}");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"i").unwrap(), 5.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm.run(b"i = 5;\nwhile i < 3 {\ni = i + 1;\n}").unwrap();
+        assert_eq!(*result.get_var(b"i").unwrap(), 5.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_accumulates() {
-        let mut vm: VmContext<'_, '_> =
-            VmContext::new(b"i = 0;\nsum = 0;\nwhile i < 5 {\nsum = sum + i;\ni = i + 1;\n}");
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 10.to_engine().unwrap());
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(b"i = 0;\nsum = 0;\nwhile i < 5 {\nsum = sum + i;\ni = i + 1;\n}")
+            .unwrap();
+        assert_eq!(*result.get_var(b"sum").unwrap(), 10.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_continue() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br"
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br"
             i = 0;
             sum = 0;
             while i < 4 {
@@ -2141,16 +2355,18 @@ mod tests {
                 sum = sum + i;
                 i = i + 1;
             }",
-        );
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 4.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"i").unwrap(), 4.to_engine().unwrap());
+            )
+            .unwrap();
+        assert_eq!(*result.get_var(b"sum").unwrap(), 4.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"i").unwrap(), 4.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_break() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br"
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br"
             i = 0;
             sum = 0;
             while i < 4 {
@@ -2160,16 +2376,18 @@ mod tests {
                 sum = sum + i;
                 i = i + 1;
             }",
-        );
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 1.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"i").unwrap(), 2.to_engine().unwrap());
+            )
+            .unwrap();
+        assert_eq!(*result.get_var(b"sum").unwrap(), 1.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"i").unwrap(), 2.to_engine().unwrap());
     }
 
     #[test]
     fn while_loop_nested() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br"
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br"
             i = 0;
             sum = 0;
             while i < 3 {
@@ -2182,31 +2400,35 @@ mod tests {
                 }
                 i = tmp;
             }",
-        );
-        vm.run().unwrap();
-        assert_eq!(*vm.get_var(b"sum").unwrap(), 9.to_engine().unwrap());
+            )
+            .unwrap();
+        assert_eq!(*result.get_var(b"sum").unwrap(), 9.to_engine().unwrap());
     }
 
     #[test]
     fn continue_outside_loop() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"continue;");
+        let mut vm: VmContext<'_> = VmContext::new();
         assert!(matches!(
-            vm.run(),
+            vm.run(b"continue;"),
             Err(InterpreterError::ContinueOutsideLoop)
         ));
     }
 
     #[test]
     fn break_outside_loop() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(b"if true { break; }");
-        assert!(matches!(vm.run(), Err(InterpreterError::BreakOutsideLoop)));
+        let mut vm: VmContext<'_> = VmContext::new();
+        assert!(matches!(
+            vm.run(b"if true { break; }"),
+            Err(InterpreterError::BreakOutsideLoop)
+        ));
     }
-
 
     #[test]
     fn fibonacci_two() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"
             fn fib_recursive(n) {
                 if n == 0 {
                     return 0;
@@ -2241,25 +2463,25 @@ mod tests {
 
             same = it_res == rc_res;
             "#,
-        );
-        vm.run().expect("Running VM with Fibonacci function");
-        assert_eq!(*vm.get_var(b"it_res").unwrap(), 55.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"rc_res").unwrap(), 55.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"same").unwrap(), true.to_engine().unwrap());
+            )
+            .expect("Running VM with Fibonacci function");
+        assert_eq!(*result.get_var(b"it_res").unwrap(), 55.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"rc_res").unwrap(), 55.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"same").unwrap(), true.to_engine().unwrap());
     }
 
     #[test]
     fn mul_overflow() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_> = VmContext::new();
+        assert!(matches!(
+            vm.run(
+                br#"
             n = 25;
             while true {
                 n = n * 25;
             }
             "#,
-        );
-        assert!(matches!(
-            vm.run(),
+            ),
             Err(InterpreterError::OperatorOverflow {
                 op: Token::Star,
                 ..
@@ -2269,8 +2491,10 @@ mod tests {
 
     #[test]
     fn test_sibling() {
-        let mut vm: VmContext<'_, '_, 32, 32> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_, 32, 32> = VmContext::new();
+        let result = vm
+            .run(
+                br#"
             fn is_even(n) {
                 if n == 0 {
                     return true;
@@ -2285,15 +2509,20 @@ mod tests {
 
             result = is_even(4);
             "#,
+            )
+            .expect("Running VM with sibling functions");
+        assert_eq!(
+            *result.get_var(b"result").unwrap(),
+            true.to_engine().unwrap()
         );
-        vm.run().expect("Running VM with sibling functions");
-        assert_eq!(*vm.get_var(b"result").unwrap(), true.to_engine().unwrap());
     }
 
     #[test]
     fn test_sibling_stack_overflow() {
-        let mut vm: VmContext<'_, '_, 32, 32> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_, 32, 32> = VmContext::new();
+        assert!(matches!(
+            vm.run(
+                br#"
             fn is_even(n) {
                 if n == 0 {
                     return true;
@@ -2308,17 +2537,17 @@ mod tests {
 
             result = is_even(5);
             "#,
-        );
-        assert!(matches!(
-            vm.run(),
+            ),
             Err(InterpreterError::ScopeStackExhausted)
         ));
     }
 
     #[test]
     fn test_collatz() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"
             fn computeChainLength(n) {
                 steps = 0;
                 while n > 1 {
@@ -2347,52 +2576,53 @@ mod tests {
                 i = i + 1;
             }
             "#,
-        );
-        vm.run().expect("Running VM with Collatz function");
+            )
+            .expect("Running VM with Collatz function");
         assert_eq!(
-            *vm.get_var(b"max_number").unwrap(),
+            *result.get_var(b"max_number").unwrap(),
             871.to_engine().unwrap()
         );
     }
 
     #[test]
     fn test_boolean_operators() {
-        let mut vm: VmContext<'_, '_> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_> = VmContext::new();
+        let result = vm
+            .run(
+                br#"
             a = true;
             b = false;
             c = a && b;
             d = a || b;
             e = !a;
             "#,
-        );
-        vm.run().expect("Running VM with boolean operators");
-        assert_eq!(*vm.get_var(b"c").unwrap(), false.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"d").unwrap(), true.to_engine().unwrap());
-        assert_eq!(*vm.get_var(b"e").unwrap(), false.to_engine().unwrap());
+            )
+            .expect("Running VM with boolean operators");
+        assert_eq!(*result.get_var(b"c").unwrap(), false.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"d").unwrap(), true.to_engine().unwrap());
+        assert_eq!(*result.get_var(b"e").unwrap(), false.to_engine().unwrap());
     }
 
     #[test]
     fn test_stack_overflow() {
-        let mut vm: VmContext<'_, '_, 32, 32> = VmContext::new(
-            br#"
+        let mut vm: VmContext<'_, 32, 32> = VmContext::new();
+        assert!(matches!(
+            vm.run(
+                br#"
             fn is_even(n) {
                 return is_even(n+1);
             }
             is_even(0);
             "#,
-        );
-        assert!(matches!(
-            vm.run(),
+            ),
             Err(InterpreterError::ScopeStackExhausted)
         ));
     }
 
     #[test]
     fn test_crash() {
-        let mut vm: VmContext<'_, '_, 16, 16> = VmContext::new(br#"6666666666&"#);
-        let result = vm.run();
-        dbg!(&result);
+        let mut vm: VmContext<'_, 16, 16> = VmContext::new();
+        let result = vm.run(br#"6666666666&"#);
         assert!(matches!(result, Err(_)));
     }
 }
