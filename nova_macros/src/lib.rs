@@ -6,7 +6,8 @@ use syn::{Fields, FnArg, ImplItem, ItemImpl, ItemStruct, Visibility, parse_macro
 /// that dispatches calls to the annotated methods based on their names and argument counts.
 ///
 /// Example usage:
-/// ```rust,no_run
+/// ```rust
+/// use nova::{VmContext, FromEngine};
 /// use nova_macros::{engine_module, script_module};
 ///
 /// #[engine_module]
@@ -19,15 +20,14 @@ use syn::{Fields, FnArg, ImplItem, ItemImpl, ItemStruct, Visibility, parse_macro
 ///     }
 /// }
 ///
-/// fn example() {
-///     let mut math = MathModule {};
-///     let mut vm: VmContext<'_> = VmContext::new()
-///         .add_module(b"math", &mut math)
-///         .unwrap();
-///     let result = vm.run(b"import math; i = math.add(1, 2);").unwrap();
+/// let mut math = MathModule {};
+/// let mut vm: VmContext<'_> = VmContext::new()
+///     .add_module(b"math", &mut math)
+///     .unwrap();
+/// let result = vm.run(b"import math; i = math.add(1, 2);").unwrap();
 ///
-///     let i = result.get_var(b"i").unwrap(); // 3
-/// }
+/// let i: i32 = FromEngine::from_engine(result.get_var(b"i").unwrap()).unwrap();
+/// assert_eq!(i, 3);
 /// ```
 #[proc_macro_attribute]
 pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream {

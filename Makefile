@@ -6,16 +6,30 @@ build:
 debug:
 	cargo build
 
-fuzz:
+fuzz-basic:
 	cargo fuzz run basic -- -fork=$$(nproc)
 
-test: test-all test-no-default
+fuzz-reuse:
+	cargo fuzz run reuse -- -fork=$$(nproc)
+
+fuzz: fuzz-basic-half fuzz-reuse-half
+
+fuzz-basic-half:
+	cargo fuzz run basic -- -fork=$$(expr $$(nproc) / 2)
+
+fuzz-reuse-half:
+	cargo fuzz run reuse -- -fork=$$(expr $$(nproc) / 2
+
+test: test-all test-no-default test-macros
 
 test-all:
 	cargo test --all-features
 
 test-no-default:
 	cargo test --no-default-features
+
+test-macros:
+	cargo test -p nova_macros --all-features
 
 coverage:
 	cargo fuzz coverage basic
@@ -30,4 +44,4 @@ coverage:
 clean:
 	cargo clean
 
-.PHONY: fuzz coverage test test-all test-no-default build debug clean
+.PHONY: fuzz coverage test test-all test-no-default test-macros build debug clean

@@ -132,6 +132,7 @@ dependencies = [
 name = "nova_macros"
 version = "0.1.0"
 dependencies = [
+ "nova",
  "proc-macro2",
  "quote",
  "syn",
