@@ -49,6 +49,14 @@
 //! ```
 
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+// Suppress dead-code warnings: some items (e.g. Display/Debug impls) are only
+// compiled under `detailed_errors` or debug builds, making other items appear
+// unused in stripped release builds.
+#![allow(dead_code)]
 
 use arrayvec::ArrayVec;
 
@@ -411,6 +419,8 @@ pub enum InterpreterError<'a> {
     InvalidEndScope,
     // For errors that don't fit any of the above categories, or when more specific information is not available, we can use a custom error message.
     Custom(&'a str),
+    /// An internal invariant was violated. This should never happen; if it does, it is a bug in the engine.
+    Internal,
 }
 
 impl InterpreterError<'_> {
@@ -559,6 +569,7 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
                 )
             }
             InterpreterError::Custom(msg) => write!(f, "Error: {}", msg),
+            InterpreterError::Internal => write!(f, "Internal engine error (this is a bug)"),
         }?;
 
         if let Some((pos, program)) = self.program_info() {
@@ -1294,7 +1305,9 @@ impl<
                     | Token::Star
                     | Token::Slash
                     | Token::Percent => {
-                        let (lbp, rbp) = self.infix_binding_power(&op).unwrap();
+                        let (lbp, rbp) = self
+                            .infix_binding_power(&op)
+                            .ok_or(InterpreterError::Internal)?;
                         while initial_ops_len < self.expression_operator_stack.len()
                             && let Some((_, top_bp)) = self.expression_operator_stack.last()
                         {
@@ -1539,7 +1552,11 @@ impl<
         &mut self,
         completed_arg: EngineObject<'a>,
     ) -> Result<EvaluationResult<'a>, InterpreterError<'a>> {
-        let args_start = self.arg_eval_stack.last().unwrap().args_start;
+        let args_start = self
+            .arg_eval_stack
+            .last()
+            .ok_or(InterpreterError::Internal)?
+            .args_start;
 
         // Push the just-finished arg.
         self.expression_stack
@@ -1567,7 +1584,10 @@ impl<
         }
 
         // All args collected — set up the call.
-        let state = self.arg_eval_stack.pop().unwrap();
+        let state = self
+            .arg_eval_stack
+            .pop()
+            .ok_or(InterpreterError::Internal)?;
         let nargs_collected = self.expression_stack.len() - args_start;
         let return_addr = self.tokenizer.cursor_pos(); // after ')'
         let outer_ops_len = state.outer_ops_len;
@@ -1720,7 +1740,10 @@ impl<
 
     /// Pops one operator and the necessary number of operands, applies the operator, and pushes the result.
     fn pop_and_apply(&mut self) -> Result<(), InterpreterError<'a>> {
-        let (op, _) = self.expression_operator_stack.pop().unwrap();
+        let (op, _) = self
+            .expression_operator_stack
+            .pop()
+            .ok_or(InterpreterError::Internal)?;
         let right = self
             .expression_stack
             .pop()

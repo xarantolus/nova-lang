@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  debug:
+    name: Build and test (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --all-features
+      - name: Test (all features)
+        run: cargo test --all-features
+      - name: Test (no default features)
+        run: cargo test --no-default-features
+      - name: Test macros
+        run: cargo test -p nova_macros --all-features
+
+  release:
+    name: Build and test (release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --all-features
+      - name: Test (all features)
+        run: cargo test --release --all-features
+      - name: Test (no default features)
+        run: cargo test --release --no-default-features
+
+  check-panic:
+    name: Panic check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - name: Clippy
+        run: cargo clippy -p nova --lib
+      - name: Ensure that panics are unreachable
+        run: cargo build --release -p check-no-panic --target thumbv7em-none-eabihf

@@ -31,6 +31,10 @@ test-no-default:
 test-macros:
 	cargo test -p nova_macros --all-features
 
+check-panic:
+	cargo clippy -p nova --lib
+	cargo build --release -p check-no-panic --target thumbv7em-none-eabihf
+
 coverage:
 	cargo fuzz coverage basic
 	grcov . \
@@ -44,4 +48,4 @@ coverage:
 clean:
 	cargo clean
 
-.PHONY: fuzz coverage test test-all test-no-default test-macros build debug clean
+.PHONY: fuzz coverage test test-all test-no-default test-macros check-panic build debug clean

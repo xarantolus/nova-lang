@@ -1,5 +1,6 @@
 workspace = { members = [
 	".",
+	"check-no-panic",
 	"fuzz",
 	"nova_macros",
 ] }
@@ -19,3 +20,7 @@ detailed_errors = []
 
 [dev-dependencies]
 similar-asserts = "1.7"
+
+[profile.release]
+lto = "thin"
+
