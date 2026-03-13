@@ -111,7 +111,7 @@ impl<'a> Tokenizer<'a> {
         let (tok1, cursor, lt) = Self::next_token_inner(self.input, self.cursor, self.last_token);
         let (tok2, _, _) = Self::next_token_inner(self.input, cursor, lt);
 
-        return (tok1, tok2);
+        (tok1, tok2)
     }
 
     /// The actual tokenization logic, stateless.

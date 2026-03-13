@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use proc_macro_warning::FormattedWarning;
 use quote::{format_ident, quote};
 use syn::{Fields, FnArg, ImplItem, ItemImpl, ItemStruct, Visibility, parse_macro_input};
 
@@ -35,10 +36,18 @@ pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream 
     let struct_ty = &input_impl.self_ty;
 
     let mut call_arms = Vec::new();
+    let mut warnings: Vec<FormattedWarning> = Vec::new();
 
     for item in &input_impl.items {
         if let ImplItem::Fn(method) = item {
             if !matches!(method.vis, Visibility::Public(_)) {
+                let name = &method.sig.ident;
+                let msg = format!(
+                    "`{}` is not `pub` and will be ignored by `#[script_module]`",
+                    name
+                );
+                let warn_name = format!("nova_script_module_non_pub_{}", warnings.len());
+                warnings.push(FormattedWarning::new_deprecated(&warn_name, &msg, name.span()));
                 continue;
             }
             let method_name = &method.sig.ident;
@@ -83,6 +92,8 @@ pub fn script_module(_metadata: TokenStream, input: TokenStream) -> TokenStream 
     TokenStream::from(quote! {
         #input_impl
 
+        #(#warnings)*
+
         #[allow(unused_qualifications)]
         const _: () = {
             use ::nova::__private::{EngineObject, FromEngine, InterpreterError, ModuleCall, ToEngine};
@@ -119,11 +130,19 @@ pub fn engine_module(_args: TokenStream, input: TokenStream) -> TokenStream {
     let name = &item_struct.ident;
 
     let mut get_arms = Vec::new();
+    let mut warnings: Vec<FormattedWarning> = Vec::new();
 
     // ItemStruct has fields directly, no need to match on Data::Struct
     if let Fields::Named(fields) = &item_struct.fields {
         for field in &fields.named {
             if !matches!(field.vis, Visibility::Public(_)) {
+                let name = field.ident.as_ref().unwrap();
+                let msg = format!(
+                    "`{}` is not `pub` and will be ignored by `#[engine_module]`",
+                    name
+                );
+                let warn_name = format!("nova_engine_module_non_pub_{}", warnings.len());
+                warnings.push(FormattedWarning::new_deprecated(&warn_name, &msg, name.span()));
                 continue;
             }
             let field_name = field.ident.as_ref().unwrap();
@@ -139,6 +158,8 @@ pub fn engine_module(_args: TokenStream, input: TokenStream) -> TokenStream {
     TokenStream::from(quote! {
         #[allow(non_snake_case)]
         #item_struct
+
+        #(#warnings)*
 
         #[allow(unused_qualifications)]
         const _: () = {

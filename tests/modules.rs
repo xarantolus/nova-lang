@@ -19,7 +19,7 @@ struct FancyMathModule {
 
 #[script_module]
 impl FancyMathModule {
-    fn set_max(&mut self, max: i32) {
+    pub fn set_max(&mut self, max: i32) {
         self.MAX_INT = max;
     }
 }
@@ -51,13 +51,16 @@ fn math_module_fancy() {
         .add_module(b"fancy_math", &mut math)
         .unwrap();
     let result = vm
-        .run(b"import fancy_math; i = fancy_math.MAX_INT;")
+        .run(b"import fancy_math; i = fancy_math.MAX_INT; fancy_math.set_max(200); j = fancy_math.MAX_INT;")
         .unwrap();
 
-    let variable = result.get_var(b"i").unwrap();
-    let result: i32 = FromEngine::from_engine(variable).unwrap();
+    let first_var = result.get_var(b"i").unwrap();
+    let first_result: i32 = FromEngine::from_engine(first_var).unwrap();
+    assert_eq!(first_result, 100);
 
-    assert_eq!(result, 100);
+    let second_var = result.get_var(b"j").unwrap();
+    let second_result: i32 = FromEngine::from_engine(second_var).unwrap();
+    assert_eq!(second_result, 200);
 }
 
 #[test]

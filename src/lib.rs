@@ -281,7 +281,7 @@ impl<'a> ToEngine<'a> for &'a str {
 
 impl<'a, T: ToEngine<'a>> ToEngine<'a> for Result<T, InterpreterError<'a>> {
     fn to_engine(self) -> Result<EngineObject<'a>, InterpreterError<'a>> {
-        self.map_err(|e| e)?.to_engine()
+        self?.to_engine()
     }
 }
 
@@ -599,7 +599,7 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
 
             let line = &program[snippet_start..line_end];
             let line_number = program[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
-            let col = (pos - current_line_start).checked_sub(1).unwrap_or(0);
+            let col = (pos - current_line_start).saturating_sub(1);
 
             write!(
                 f,
@@ -1184,7 +1184,7 @@ impl<
 
             for i in (start..end).rev() {
                 if self.variables[i].name == name {
-                    return Ok(&mut self.variables[i].value);
+                    return Ok(&self.variables[i].value);
                 }
             }
 
@@ -1197,7 +1197,7 @@ impl<
         if let Some(&global_count) = self.current_block_scope.first() {
             for i in (0..global_count).rev() {
                 if self.variables[i].name == name {
-                    return Ok(&mut self.variables[i].value);
+                    return Ok(&self.variables[i].value);
                 }
             }
         }
@@ -1750,35 +1750,25 @@ impl<
             .ok_or(InterpreterError::ExpressionStackEmpty)?;
         let right = self.resolve_if_member(right)?;
 
-        match op {
-            // Unary operators
-            Token::Bang => {
-                match right {
-                    EngineObject::Bool(b) => {
-                        self.expression_stack
-                            .try_push(EngineObject::Bool(!b))
-                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-                        return Ok(());
-                    }
-                    EngineObject::Int(i) => {
-                        self.expression_stack
-                            .try_push(EngineObject::Int(if i == 0 { 1 } else { 0 }))
-                            .map_err(|_| InterpreterError::ExpressionStackOverflow)?;
-                        return Ok(());
-                    }
-                    _ => {
-                        return Err(InterpreterError::InvalidUnaryOperation {
-                            op,
-                            obj: right,
-                            program: self.tokenizer.input(),
-                            token_pos: self.tokenizer.last_token_pos(),
-                        });
-                    }
-                };
-            }
+        if op == Token::Bang {
             // Note that minus is handled as 0 - right, so no need to handle it here
             // Also note that plus is allowed, but ignored as unary operator
-            _ => {} // Non-unary operators are handled in the main loop
+            return match right {
+                EngineObject::Bool(b) => self
+                    .expression_stack
+                    .try_push(EngineObject::Bool(!b))
+                    .map_err(|_| InterpreterError::ExpressionStackOverflow),
+                EngineObject::Int(i) => self
+                    .expression_stack
+                    .try_push(EngineObject::Int(if i == 0 { 1 } else { 0 }))
+                    .map_err(|_| InterpreterError::ExpressionStackOverflow),
+                _ => Err(InterpreterError::InvalidUnaryOperation {
+                    op,
+                    obj: right,
+                    program: self.tokenizer.input(),
+                    token_pos: self.tokenizer.last_token_pos(),
+                }),
+            };
         }
 
         let left = self
@@ -1916,6 +1906,19 @@ impl<
             }
         }
         Ok(())
+    }
+}
+
+impl<
+    'm,
+    const STACK_SIZE: usize,
+    const MAX_SCOPE_DEPTH: usize,
+    const MAX_EXPRESSION_DEPTH: usize,
+    const MAX_MODULES: usize,
+> Default for VmContext<'m, STACK_SIZE, MAX_SCOPE_DEPTH, MAX_EXPRESSION_DEPTH, MAX_MODULES>
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
