@@ -237,6 +237,13 @@ impl core::fmt::Debug for EngineObject<'_> {
     }
 }
 
+#[cfg(not(any(debug_assertions, test, feature = "detailed_errors")))]
+impl core::fmt::Debug for EngineObject<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("EngineObject")
+    }
+}
+
 impl<'a> FromEngine<'a> for i32 {
     fn from_engine(obj: &EngineObject<'a>) -> Result<Self, InterpreterError<'a>> {
         if let EngineObject::Int(i) = obj {
@@ -616,6 +623,14 @@ impl<'a> core::fmt::Debug for InterpreterError<'a> {
         Ok(())
     }
 }
+
+#[cfg(not(any(debug_assertions, test, feature = "detailed_errors")))]
+impl core::fmt::Debug for InterpreterError<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("InterpreterError")
+    }
+}
+
 /// Enum to track the result of an expression evaluation.
 enum EvaluationResult<'a> {
     /// The expression calculated a final value immediately.
