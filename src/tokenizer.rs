@@ -217,20 +217,18 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 b'&' => {
-                    if cursor < input.len() && input[cursor] == b'&' {
+                    if let Some(&b'&') = input.get(cursor) {
                         cursor += 1; // Consume second '&'
                         return (Token::AndAnd, cursor, Some(Token::AndAnd));
-                    } else {
-                        return (Token::Error, cursor, Some(Token::Error));
                     }
+                    return (Token::Error, cursor, Some(Token::Error));
                 }
                 b'|' => {
-                    if cursor < input.len() && input[cursor] == b'|' {
+                    if let Some(&b'|') = input.get(cursor) {
                         cursor += 1; // Consume second '|'
                         return (Token::OrOr, cursor, Some(Token::OrOr));
-                    } else {
-                        return (Token::Error, cursor, Some(Token::Error));
                     }
+                    return (Token::Error, cursor, Some(Token::Error));
                 }
 
                 // --- String Literals ---
